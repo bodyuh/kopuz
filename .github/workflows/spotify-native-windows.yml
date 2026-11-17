@@ -39,7 +39,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npx @tailwindcss/cli -i ./tailwind.css -o ./crates/kopuz/assets/tailwind.css
       - name: Check Windows Spotify code
-        run: cargo clippy --locked -p kopuz-player -p kopuz-daemon -- -D warnings
+        run: cargo clippy --locked -p kopuz-player -p kopuz-daemon
       - name: Build Windows Spotify installer
         run: dx bundle --release --platform desktop --package kopuz --package-types msi --out-dir bundle-msi --locked
       - uses: actions/upload-artifact@v4

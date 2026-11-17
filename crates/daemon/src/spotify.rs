@@ -678,9 +678,8 @@ impl ExternalPlayer for SpotifySink {
         #[cfg(windows)]
         {
             self.soloist.set_volume(volume);
-            let own = self.with_state(|state| {
-                state.device.is_some() && state.selected == state.device
-            });
+            let own =
+                self.with_state(|state| state.device.is_some() && state.selected == state.device);
             if own {
                 return Ok(());
             }

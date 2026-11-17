@@ -131,14 +131,16 @@ impl Soloist {
                 ApiError::internal(format!("Could not create {}: {error}", dir.display()))
             })?;
         }
-        let log = File::create(home.join("soloist.log"))
-            .map_err(|error| ApiError::internal(format!("Could not open the Soloist log: {error}")))?;
+        let log = File::create(home.join("soloist.log")).map_err(|error| {
+            ApiError::internal(format!("Could not open the Soloist log: {error}"))
+        })?;
         let log_err = log
             .try_clone()
             .map_err(|error| ApiError::internal(error.to_string()))?;
 
-        let job = Job::kill_on_close()
-            .map_err(|error| ApiError::internal(format!("Could not create a job object: {error}")))?;
+        let job = Job::kill_on_close().map_err(|error| {
+            ApiError::internal(format!("Could not create a job object: {error}"))
+        })?;
         let child = Command::new(&exe)
             .arg("--device-name")
             .arg(DEVICE_NAME)
@@ -244,7 +246,9 @@ async fn find_device(access: &str, child: &mut Child) -> Result<String, ApiError
         }
         match server::spotify::api::devices(access).await {
             Ok(devices) => {
-                if let Some(device) = devices.into_iter().find(|device| device.name == DEVICE_NAME)
+                if let Some(device) = devices
+                    .into_iter()
+                    .find(|device| device.name == DEVICE_NAME)
                 {
                     return Ok(device.id);
                 }
