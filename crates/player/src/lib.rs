@@ -4,6 +4,8 @@
 pub mod decoder;
 pub mod engine;
 pub mod eq;
+#[cfg(windows)]
+pub mod loopback;
 pub mod player;
 pub(crate) mod replaygain;
 pub mod systemint;

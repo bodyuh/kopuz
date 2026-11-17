@@ -47,6 +47,12 @@ librespot-core = { git = "https://github.com/crmne/librespot", rev = "8ba22cd441
 librespot-playback = { git = "https://github.com/crmne/librespot", rev = "8ba22cd44168155b490e56aba80875771f27b75c", default-features = false, features = ["rustls-tls-native-roots"] }
 rtrb = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }

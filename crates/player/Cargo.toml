@@ -55,6 +55,8 @@ mpris-server = { workspace = true, features = ["unstable"] }
 tokio = { workspace = true, features = ["full"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# `#[implement]` expands to paths in windows-core.
+windows-core = "0.62"
 windows = { workspace = true, features = [
   "Foundation",
   "Media",
@@ -65,6 +67,10 @@ windows = { workspace = true, features = [
   "Win32_UI_Shell",
   "Storage_Streams",
   "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Media_Audio",
+  "Win32_Security",
 ] }
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["blocking"] }

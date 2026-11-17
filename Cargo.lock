@@ -4906,6 +4906,7 @@ dependencies = [
  "tracing",
  "uuid 1.23.5",
  "webbrowser",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -5048,6 +5049,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
