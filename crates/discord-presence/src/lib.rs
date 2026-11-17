@@ -16,6 +16,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(not(target_os = "android"))]
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The activity name shown after "Listening to": a Hangul filler, which
+/// Discord keeps but renders as nothing, so the line shows no app name.
+#[cfg(not(target_os = "android"))]
+const BLANK_NAME: &str = "\u{3164}";
+
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone)]
 struct StoredActivity {
@@ -200,7 +205,7 @@ impl Presence {
         elapsed_secs: u64,
         duration_secs: u64,
         cover_url: Option<&str>,
-        source: Option<&str>,
+        _source: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
@@ -216,7 +221,7 @@ impl Presence {
         self.set_and_deliver(StoredActivity {
             details: title.to_owned(),
             state: artist.to_owned(),
-            name: source.map(|s| format!("Kopuz - on {s}")),
+            name: Some(BLANK_NAME.to_string()),
             timestamps: Some(timestamps),
             assets: cover_url.map(|url| (url.to_owned(), album.to_owned())),
         })
@@ -228,12 +233,12 @@ impl Presence {
         artist: &str,
         album: &str,
         cover_url: Option<&str>,
-        source: Option<&str>,
+        _source: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.set_and_deliver(StoredActivity {
             details: title.to_owned(),
             state: format!("{artist} • Paused"),
-            name: source.map(|s| format!("Kopuz - on {s}")),
+            name: Some(BLANK_NAME.to_string()),
             timestamps: None,
             assets: cover_url.map(|url| (url.to_owned(), album.to_owned())),
         })

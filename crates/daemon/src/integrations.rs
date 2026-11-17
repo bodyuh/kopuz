@@ -543,10 +543,10 @@ fn project(
             let key = track.map(|t| t.key.clone()).unwrap_or_default();
             discord.cover_task = Some(tokio::spawn(async move {
                 let track = session.queued_track(&key).await;
-                let resolved = match track
-                    .as_ref()
-                    .and_then(discord_presence::cover_art::youtube_cover_art_url)
-                {
+                let resolved = match track.as_ref().and_then(|track| {
+                    service_cover_url(track)
+                        .or_else(|| discord_presence::cover_art::youtube_cover_art_url(track))
+                }) {
                     Some(url) => Some(url),
                     None if session.offline().offline_mode() => None,
                     None => {
@@ -617,6 +617,20 @@ fn project(
 
     discord.was_playing = playing;
     discord.last_enabled = enabled;
+}
+
+/// The streaming service's own artwork for the track, which is the cover the
+/// listener sees; a SoundCloud cover is asked for at 500 px instead of 100.
+fn service_cover_url(track: &reader::Track) -> Option<String> {
+    let cover = track.cover.as_deref()?.trim();
+    if !cover.starts_with("https://") {
+        return None;
+    }
+    match track.id.service()? {
+        config::MusicService::SoundCloud => Some(cover.replace("-large.", "-t500x500.")),
+        config::MusicService::Spotify => Some(cover.to_string()),
+        _ => None,
+    }
 }
 
 /// The integration ids a client addresses these by.
