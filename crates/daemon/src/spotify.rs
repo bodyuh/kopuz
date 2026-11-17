@@ -66,6 +66,12 @@ struct State {
     playing_key: Option<String>,
     last_refresh: Option<Instant>,
     poll: Option<tokio::task::JoinHandle<()>>,
+    /// The track Kopuz asked its own Soloist to play, by Spotify id.
+    #[cfg(windows)]
+    own: Option<(String, Track)>,
+    /// Whether Soloist's events are being followed.
+    #[cfg(windows)]
+    watching: bool,
 }
 
 /// The Web API access token `sources` hold for an active Spotify source.
@@ -128,9 +134,15 @@ impl SpotifySink {
         let devices = server::spotify::api::devices(&access)
             .await
             .map_err(crate::sources::source_error)?;
+        // Kopuz's own Soloist is "this app", not a device to pick.
+        #[cfg(windows)]
+        let own_name = Some(soloist::DEVICE_NAME);
+        #[cfg(not(windows))]
+        let own_name: Option<&str> = None;
         Ok(devices
             .into_iter()
             .filter(|device| Some(&device.id) != own.as_ref())
+            .filter(|device| Some(device.name.as_str()) != own_name)
             .map(|device| ExternalDevice {
                 active: selected.as_deref() == Some(device.id.as_str()) || device.is_active,
                 id: device.id,
@@ -149,16 +161,18 @@ impl SpotifySink {
         let target = self.with_state(|state| {
             state.chosen = true;
             state.selected = device_id.clone();
-            // Kopuz's own device on Windows is Soloist, followed like any
-            // other Connect device.
-            #[cfg(windows)]
-            if state.selected.is_none() {
-                state.selected = state.device.clone();
-            }
             device_id.clone().or_else(|| state.device.clone())
         });
-        let follow = self.with_state(|state| state.selected.is_some());
-        self.restart_poll(follow);
+        self.restart_poll(device_id.is_some());
+        // Back to this app on Windows is back to Kopuz's own Soloist.
+        #[cfg(windows)]
+        if device_id.is_none() {
+            self.soloist.ready(&self.session).await?;
+            self.watch_soloist();
+            return self
+                .soloist
+                .send(serde_json::json!({ "command": "activate" }));
+        }
         let Some(target) = target else {
             return Ok(());
         };
@@ -228,6 +242,14 @@ impl SpotifySink {
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(%error, "spotify player state poll failed");
+                    // An hour-old token is refused; renew it rather than
+                    // polling with it forever.
+                    if error.contains("401")
+                        && self.refresh_due()
+                        && let Err(error) = self.refresh().await
+                    {
+                        tracing::warn!(%error, "spotify token refresh failed");
+                    }
                     continue;
                 }
             };
@@ -421,29 +443,94 @@ impl SpotifySink {
         self.start_uri(device, uri).await;
     }
 
-    /// Play `uri` on Kopuz's own Soloist, starting it first if needed.
+    /// Play `track` on Kopuz's own Soloist, starting it first if needed.
     #[cfg(windows)]
-    async fn load_soloist(&self, uri: String) -> Result<(), ApiError> {
-        let access = self.require_access()?;
-        let device = match self.soloist.ready(&self.session, &access).await {
-            Ok(device) => device,
-            Err(error) => {
-                self.notice(error.to_string());
-                return Err(error);
-            }
-        };
-        let follow = self.with_state(|state| {
-            let follow = state.selected.as_deref() != Some(device.as_str());
-            state.device = Some(device.clone());
-            state.selected = Some(device.clone());
-            state.pending_uri = None;
-            follow
-        });
-        if follow && let Some(sink) = self.arc() {
-            sink.restart_poll(true);
+    async fn load_soloist(&self, track: &Track, uri: String) -> Result<(), ApiError> {
+        if let Err(error) = self.soloist.ready(&self.session).await {
+            self.notice(error.to_string());
+            return Err(error);
         }
-        self.start_uri(device, uri).await;
-        Ok(())
+        let key = track.id.key().into_owned();
+        self.with_state(|state| {
+            state.own = Some((key, track.clone()));
+            state.pending_uri = None;
+        });
+        if let Some(sink) = self.arc() {
+            sink.watch_soloist();
+        }
+        self.soloist
+            .send(serde_json::json!({ "command": "play", "uri": uri }))
+    }
+
+    /// Turn Soloist's own events into reports, as they happen: play state,
+    /// position and the end of a track, with no token and no polling.
+    #[cfg(windows)]
+    fn watch_soloist(self: &Arc<Self>) {
+        if self.with_state(|state| std::mem::replace(&mut state.watching, true)) {
+            return;
+        }
+        let sink = self.clone();
+        let mut events = self.soloist.subscribe();
+        tokio::spawn(async move {
+            let mut last_key: Option<String> = None;
+            let mut near_end = false;
+            while events.changed().await.is_ok() {
+                let now = events.borrow_and_update().clone();
+                if sink.with_state(|state| state.selected.is_some()) {
+                    continue;
+                }
+                let Some((key, track)) = sink.with_state(|state| state.own.clone()) else {
+                    continue;
+                };
+                if last_key.as_deref() != Some(key.as_str()) {
+                    last_key = Some(key.clone());
+                    near_end = false;
+                }
+                let duration = match now.duration_ms {
+                    0 => track.duration * 1000,
+                    known => known,
+                };
+                let reported = now
+                    .uri
+                    .as_deref()
+                    .and_then(|uri| uri.strip_prefix("spotify:track:"));
+                if reported == Some(key.as_str()) {
+                    let mut position = now.position_now();
+                    if duration > 0 {
+                        position = position.min(duration);
+                    }
+                    let playing = now.playing();
+                    near_end = duration > 0 && position + 5000 >= duration;
+                    let completed = !playing
+                        && now.status != "buffering"
+                        && duration > 0
+                        && position + 1500 >= duration;
+                    sink.report(ExternalReport {
+                        cover_url: track.cover.clone(),
+                        track: Some(track),
+                        position_ms: position,
+                        playing,
+                        completed,
+                        device: None,
+                    });
+                } else if near_end && reported.is_some() {
+                    // Spotify moved on by itself at the end of the track; the
+                    // queue is Kopuz's, so stop that and let Kopuz advance.
+                    near_end = false;
+                    let _ = sink
+                        .soloist
+                        .send(serde_json::json!({ "command": "pause" }));
+                    sink.report(ExternalReport {
+                        cover_url: track.cover.clone(),
+                        track: Some(track),
+                        position_ms: duration,
+                        playing: false,
+                        completed: true,
+                        device: None,
+                    });
+                }
+            }
+        });
     }
 
     async fn start_uri(&self, device: String, uri: String) {
@@ -595,11 +682,8 @@ impl ExternalPlayer for SpotifySink {
 
         let selected = self.with_state(|state| state.selected.clone());
         #[cfg(windows)]
-        {
-            let own = self.with_state(|state| state.device.clone());
-            if selected.is_none() || selected == own {
-                return self.load_soloist(uri).await;
-            }
+        if selected.is_none() {
+            return self.load_soloist(track, uri).await;
         }
 
         if let Some(device) = selected {
@@ -637,6 +721,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.soloist
+            .send(serde_json::json!({ "command": "play" }))?;
         #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.resume();
@@ -651,6 +738,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.soloist
+            .send(serde_json::json!({ "command": "pause" }))?;
         #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.pause();
@@ -665,6 +755,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.soloist
+            .send(serde_json::json!({ "command": "seek", "position_ms": position_ms }))?;
         #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.seek(position_ms);
@@ -678,9 +771,7 @@ impl ExternalPlayer for SpotifySink {
         #[cfg(windows)]
         {
             self.soloist.set_volume(volume);
-            let own =
-                self.with_state(|state| state.device.is_some() && state.selected == state.device);
-            if own {
+            if self.with_state(|state| state.selected.is_none()) {
                 return Ok(());
             }
         }

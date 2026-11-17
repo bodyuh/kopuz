@@ -1,30 +1,34 @@
 //! Windows Spotify playback through Spotify Soloist, heard through Kopuz.
 //!
 //! Soloist is Spotify's own headless Connect device. Kopuz starts it with no
-//! window, ties its lifetime to this process, and drives it over the Web API
-//! like any other Connect device. Its audio is captured per process and
-//! played again through Kopuz's equalizer and volume, so the equalizer
-//! touches only the player.
+//! window, ties its lifetime to this process, and drives it over Soloist's
+//! local WebSocket API, which also reports play state and position as they
+//! change, without the Web API's token or delay. Its audio is captured per
+//! process and played again through Kopuz's equalizer and volume, so the
+//! equalizer touches only the player.
 //!
-//! Windows applies a process's mixer mute before the capture, so Soloist has
-//! to render to an output nobody listens to (set once in Windows' volume
-//! mixer); the captured stream then plays on the default output.
+//! Windows applies a process's mixer mute before the capture, so Soloist is
+//! moved to an output nobody listens to; the captured stream then plays on
+//! the default output.
 
 use std::fs::File;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{ApiError, ErrorCode};
+use futures_util::{SinkExt, StreamExt};
 use player::engine::{AudioSink, CpalSink, SinkConfig, SinkEvent, convert_channels, resample};
 use player::loopback::{self, ProcessCapture};
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use serde_json::Value;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio_tungstenite::tungstenite::Message;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -35,19 +39,104 @@ use windows::core::PCWSTR;
 
 use crate::session::SessionHandle;
 
-/// The Connect device name Soloist announces, and how Kopuz finds it again.
+/// The Connect device name Soloist announces.
 pub(super) const DEVICE_NAME: &str = "Kopuz";
 
-/// How long a fresh Soloist gets to show up in the account's device list.
-const APPEAR_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a fresh Soloist gets to restore its sign-in.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a fresh Soloist gets to open its WebSocket.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Soloist's exit code for a build past its 90-day lifetime.
 const EXIT_EXPIRED: i32 = 10;
+const EXPIRED: &str =
+    "This Spotify Soloist build has expired. Download the current one and replace soloist.exe.";
+
+/// What Soloist reports about itself over its WebSocket.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct SoloistState {
+    pub logged_in: bool,
+    pub uri: Option<String>,
+    /// `idle`, `playing`, `paused` or `buffering`.
+    pub status: String,
+    pub duration_ms: u64,
+    position_ms: u64,
+    /// Unix milliseconds at which `position_ms` held.
+    timestamp_ms: u64,
+    speed: f64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl SoloistState {
+    pub fn playing(&self) -> bool {
+        matches!(self.status.as_str(), "playing" | "buffering")
+    }
+
+    /// The position now, advanced from the last anchor while playing.
+    pub fn position_now(&self) -> u64 {
+        if self.status != "playing" {
+            return self.position_ms;
+        }
+        let elapsed = now_ms().saturating_sub(self.timestamp_ms) as f64 * self.speed.max(0.0);
+        self.position_ms.saturating_add(elapsed as u64)
+    }
+
+    fn apply(&mut self, event: &Value) {
+        match event["type"].as_str() {
+            Some("auth_state") => self.logged_in = event["logged_in"].as_bool().unwrap_or(false),
+            Some("playback_state") => {
+                if let Some(status) = event["status"].as_str() {
+                    self.status = status.to_string();
+                }
+                self.set_item(&event["item"]);
+                self.set_position(&event["position"]);
+            }
+            Some("position_sync") => self.set_position(&event["position"]),
+            Some("track_changed") => self.set_item(&event["item"]),
+            Some("playback_changed") => {
+                if let Some(status) = event["status"].as_str() {
+                    // Freeze the position where it was when playback stopped.
+                    self.position_ms = self.position_now();
+                    self.timestamp_ms = now_ms();
+                    self.status = status.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_item(&mut self, item: &Value) {
+        let uri = item["uri"].as_str().map(str::to_string);
+        let duration = item["decorations"]["playback"]["duration_ms"].as_u64();
+        if uri != self.uri {
+            self.uri = uri;
+            self.duration_ms = duration.unwrap_or(0);
+        } else if let Some(duration) = duration {
+            self.duration_ms = duration;
+        }
+    }
+
+    fn set_position(&mut self, position: &Value) {
+        if let Some(ms) = position["position_ms"].as_u64() {
+            self.position_ms = ms;
+            self.timestamp_ms = position["timestamp_ms"].as_u64().unwrap_or_else(now_ms);
+            self.speed = position["speed"].as_f64().unwrap_or(0.0);
+        }
+    }
+}
 
 pub(super) struct Soloist {
     running: AsyncMutex<Option<Running>>,
     volume: Arc<AtomicU32>,
+    state: Arc<watch::Sender<SoloistState>>,
+    commands: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 struct Running {
@@ -55,11 +144,12 @@ struct Running {
     // Declared after `child` so the process is killed before the job closes.
     _job: Job,
     capture: ProcessCapture,
-    device: Option<String>,
+    control: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
+        self.control.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -70,6 +160,8 @@ impl Soloist {
         Self {
             running: AsyncMutex::new(None),
             volume: Arc::new(AtomicU32::new(volume.clamp(0.0, 1.0).to_bits())),
+            state: Arc::new(watch::Sender::new(SoloistState::default())),
+            commands: Mutex::new(None),
         }
     }
 
@@ -78,41 +170,58 @@ impl Soloist {
             .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
-    /// The Connect device id of a running, paired Soloist, starting it first
-    /// when it is not running.
-    pub(super) async fn ready(
-        &self,
-        app: &SessionHandle,
-        access: &str,
-    ) -> Result<String, ApiError> {
-        let mut running = self.running.lock().await;
-        if let Some(current) = running.as_mut() {
-            match current.child.try_wait() {
-                Ok(None) if !current.capture.finished() => {
-                    if let Some(device) = current.device.clone() {
-                        return Ok(device);
-                    }
-                }
-                Ok(Some(status)) if status.code() == Some(EXIT_EXPIRED) => {
-                    *running = None;
-                    return Err(ApiError::internal(
-                        "This Spotify Soloist build has expired. Download the current one \
-                         and replace soloist.exe.",
-                    ));
-                }
-                _ => *running = None,
-            }
-        }
-        if running.is_none() {
-            *running = Some(self.start(app)?);
-        }
-        let current = running.as_mut().expect("just started");
-        let device = find_device(access, &mut current.child).await?;
-        current.device = Some(device.clone());
-        Ok(device)
+    pub(super) fn subscribe(&self) -> watch::Receiver<SoloistState> {
+        self.state.subscribe()
     }
 
-    fn start(&self, app: &SessionHandle) -> Result<Running, ApiError> {
+    /// Send one WebSocket command, such as `{"command": "pause"}`.
+    pub(super) fn send(&self, mut command: Value) -> Result<(), ApiError> {
+        command["type"] = Value::from("command");
+        let sender = self
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        sender
+            .and_then(|sender| sender.send(command.to_string()).ok())
+            .ok_or_else(|| ApiError::internal("Spotify Soloist is not running"))
+    }
+
+    /// Make sure Soloist runs, answers on its socket and is signed in.
+    pub(super) async fn ready(&self, app: &SessionHandle) -> Result<(), ApiError> {
+        {
+            let mut running = self.running.lock().await;
+            if let Some(current) = running.as_mut() {
+                match current.child.try_wait() {
+                    Ok(None) if !current.capture.finished() && !current.control.is_finished() => {}
+                    Ok(Some(status)) if status.code() == Some(EXIT_EXPIRED) => {
+                        *running = None;
+                        return Err(ApiError::internal(EXPIRED));
+                    }
+                    _ => *running = None,
+                }
+            }
+            if running.is_none() {
+                *running = Some(self.start(app).await?);
+            }
+        }
+        let mut state = self.state.subscribe();
+        let signed_in = tokio::time::timeout(SIGN_IN_TIMEOUT, async move {
+            state.wait_for(|it| it.logged_in).await.map(|_| ())
+        });
+        match signed_in.await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(ApiError::new(
+                ErrorCode::SourceAuthExpired,
+                format!(
+                    "Soloist is not signed in. Pick \"{DEVICE_NAME}\" once in a Spotify app on \
+                     this network, then press play again."
+                ),
+            )),
+        }
+    }
+
+    async fn start(&self, app: &SessionHandle) -> Result<Running, ApiError> {
         let home = home()?;
         let exe = std::env::var_os("KOPUZ_SOLOIST_EXE")
             .map(PathBuf::from)
@@ -132,6 +241,7 @@ impl Soloist {
             })?;
         }
         stop_stale(&data);
+        let _ = std::fs::remove_file(data.join("ws.port"));
         let log = File::create(home.join("soloist.log")).map_err(|error| {
             ApiError::internal(format!("Could not open the Soloist log: {error}"))
         })?;
@@ -142,7 +252,7 @@ impl Soloist {
         let job = Job::kill_on_close().map_err(|error| {
             ApiError::internal(format!("Could not create a job object: {error}"))
         })?;
-        let child = Command::new(&exe)
+        let mut child = Command::new(&exe)
             .arg("--device-name")
             .arg(DEVICE_NAME)
             .arg("--api-key")
@@ -153,6 +263,8 @@ impl Soloist {
             .arg(&cache)
             .arg("--initial-volume")
             .arg("100")
+            .arg("--ws")
+            .arg("127.0.0.1:0")
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(log_err)
@@ -164,6 +276,21 @@ impl Soloist {
         }
         let pid = child.id();
         tracing::info!(pid, exe = %exe.display(), "started Spotify Soloist");
+
+        let port = match socket_port(&data, &mut child).await {
+            Ok(port) => port,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        *self
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(commands);
+        self.state.send_replace(SoloistState::default());
+        let control = tokio::spawn(control(port, self.state.clone(), receiver));
 
         let settings = app.settings_watch();
         let volume = self.volume.clone();
@@ -201,7 +328,7 @@ impl Soloist {
         let capture = match capture {
             Ok(capture) => capture,
             Err(error) => {
-                let mut child = child;
+                control.abort();
                 let _ = child.kill();
                 return Err(ApiError::internal(format!(
                     "Could not capture Soloist's audio: {error}"
@@ -212,9 +339,82 @@ impl Soloist {
             child,
             _job: job,
             capture,
-            device: None,
+            control,
         })
     }
+}
+
+/// The port Soloist's WebSocket picked, from the file it writes once
+/// listening.
+async fn socket_port(data: &Path, child: &mut Child) -> Result<u16, ApiError> {
+    let deadline = Instant::now() + SOCKET_TIMEOUT;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(ApiError::internal(if status.code() == Some(EXIT_EXPIRED) {
+                EXPIRED.to_string()
+            } else {
+                format!("Spotify Soloist exited ({status}); see soloist.log")
+            }));
+        }
+        if let Ok(text) = std::fs::read_to_string(data.join("ws.port"))
+            && let Ok(port) = text.trim().parse::<u16>()
+            && port != 0
+        {
+            return Ok(port);
+        }
+        if Instant::now() >= deadline {
+            return Err(ApiError::internal(
+                "Spotify Soloist did not open its control socket; see soloist.log",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Keep the WebSocket to Soloist: forward commands, fold events into state.
+async fn control(
+    port: u16,
+    state: Arc<watch::Sender<SoloistState>>,
+    mut commands: mpsc::UnboundedReceiver<String>,
+) {
+    let socket = match tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")).await {
+        Ok((socket, _)) => socket,
+        Err(error) => {
+            tracing::warn!(%error, "could not connect to Soloist's control socket");
+            return;
+        }
+    };
+    let (mut write, mut read) = socket.split();
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                if let Err(error) = write.send(Message::Text(command.into())).await {
+                    tracing::warn!(%error, "Soloist control socket write failed");
+                    break;
+                }
+            }
+            message = read.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(event) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    if event["type"] == "error" {
+                        tracing::warn!(reason = %event["message"], "Soloist refused a command");
+                    }
+                    state.send_if_modified(|current| {
+                        let before = current.clone();
+                        current.apply(&event);
+                        *current != before
+                    });
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+    tracing::info!("Soloist control socket closed");
+    state.send_replace(SoloistState::default());
 }
 
 /// Soloist allows one process per data directory. A Soloist left over from a
@@ -290,48 +490,6 @@ fn api_key(home: &std::path::Path) -> Result<String, ApiError> {
         ));
     }
     Ok(key.to_string())
-}
-
-/// Wait for Soloist to appear in the account's devices. An unpaired Soloist
-/// never does until it is picked once in a Spotify app on the same network.
-async fn find_device(access: &str, child: &mut Child) -> Result<String, ApiError> {
-    let deadline = Instant::now() + APPEAR_TIMEOUT;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(ApiError::internal(if status.code() == Some(EXIT_EXPIRED) {
-                "This Spotify Soloist build has expired. Download the current one and \
-                 replace soloist.exe."
-                    .to_string()
-            } else {
-                format!("Spotify Soloist exited ({status}); see soloist.log")
-            }));
-        }
-        match server::spotify::api::devices(access).await {
-            Ok(devices) => {
-                if let Some(device) = devices
-                    .into_iter()
-                    .find(|device| device.name == DEVICE_NAME)
-                {
-                    // Spotify may still list a device that another process
-                    // owns; only one this Kopuz started and still runs counts.
-                    if child.try_wait().is_ok_and(|status| status.is_none()) {
-                        return Ok(device.id);
-                    }
-                }
-            }
-            Err(error) => tracing::debug!(%error, "spotify devices poll failed"),
-        }
-        if Instant::now() >= deadline {
-            return Err(ApiError::new(
-                ErrorCode::SourceAuthExpired,
-                format!(
-                    "Soloist is running but not signed in. Pick \"{DEVICE_NAME}\" once in the \
-                     Spotify app on a phone on the same network, then press play again."
-                ),
-            ));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
 }
 
 /// A job object that kills its processes when Kopuz goes away, even when
