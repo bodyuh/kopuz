@@ -1,0 +1,40 @@
+name: Spotify-style EQ for Windows
+
+on:
+  push:
+    branches: [spotify-style-eq]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spotify-style-eq-windows
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa
+      - name: Install Dioxus CLI
+        run: cargo binstall dioxus-cli@0.7.9 -y --force --disable-strategies compile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add Cargo bin to PATH
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          Join-Path $cargoHome "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Build CSS
+        run: npx @tailwindcss/cli -i ./tailwind.css -o ./crates/kopuz/assets/tailwind.css
+      - name: Build Windows installer
+        run: dx bundle --release --platform desktop --package kopuz --package-types nsis --out-dir bundle-nsis --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kopuz-Spotify-EQ-Windows
+          path: bundle-nsis/*.exe
+          if-no-files-found: error

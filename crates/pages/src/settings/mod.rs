@@ -2,6 +2,8 @@ mod desktop_tools;
 mod index;
 mod navigation;
 mod sections;
+#[cfg(target_os = "windows")]
+mod system_equalizer;
 
 use desktop_tools::{logs_section, theme_editor_section};
 use index::SettingsIndex;

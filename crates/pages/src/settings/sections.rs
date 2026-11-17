@@ -719,8 +719,14 @@ pub(super) fn PlayerSection(settings: Signal<Settings>) -> Element {
 
 #[component]
 pub(super) fn EqualizerSection(settings: Signal<Settings>) -> Element {
+    #[cfg(target_os = "windows")]
+    let system_eq = rsx! { super::system_equalizer::SystemEqualizer {} };
+    #[cfg(not(target_os = "windows"))]
+    let system_eq = rsx! {};
+
     rsx! {
         SettingsSection { title: i18n::t("equalizer").to_string(),
+            {system_eq}
             EqualizerItem { settings }
         }
     }
