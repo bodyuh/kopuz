@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use dioxus::prelude::*;
 
 const FREQUENCIES: [u32; 6] = [60, 150, 400, 1_000, 2_400, 15_000];
+const FILTER_SHAPES: [(&str, f64); 6] = [
+    ("LSC", std::f64::consts::FRAC_1_SQRT_2),
+    ("PK", 1.0),
+    ("PK", 1.0),
+    ("PK", 1.0),
+    ("PK", 1.0),
+    ("HSC", std::f64::consts::FRAC_1_SQRT_2),
+];
 const LABELS: [&str; 6] = ["60 Hz", "150 Hz", "400 Hz", "1 kHz", "2.4 kHz", "15 kHz"];
 const PRESETS: [(&str, [f32; 6]); 5] = [
     ("Flat", [0.0; 6]),
@@ -53,7 +61,9 @@ impl Profile {
                 let (name, value) = line.split_once('=')?;
                 (name.trim() == prefix).then_some(value.trim())
             }) {
-                profile.gains[index] = parse_gain(value)?;
+                // Spotify stores the band gains as signed 32-bit values scaled to ±12 dB.
+                let raw: i32 = value.trim_matches('"').parse().ok()?;
+                profile.gains[index] = (raw as f32 / i32::MAX as f32) * 12.0;
                 found = true;
             }
         }
@@ -70,18 +80,10 @@ impl Profile {
             return config;
         }
 
-        // Reserve enough headroom even where multiple filter boosts overlap.
-        let boost: f32 = self.gains.into_iter().map(|gain| gain.max(0.0)).sum();
-        let _ = writeln!(config, "Preamp: {:.3} dB", -boost);
-        let shape = [
-            ("LSC", 0.707_107),
-            ("PK", 1.0),
-            ("PK", 1.0),
-            ("PK", 1.0),
-            ("PK", 1.0),
-            ("HSC", 0.707_107),
-        ];
-        for ((frequency, gain), (kind, q)) in FREQUENCIES.into_iter().zip(self.gains).zip(shape) {
+        let _ = writeln!(config, "Preamp: {:.1} dB", -self.headroom_db());
+        for ((frequency, gain), (kind, q)) in
+            FREQUENCIES.into_iter().zip(self.gains).zip(FILTER_SHAPES)
+        {
             if gain != 0.0 {
                 let _ = writeln!(
                     config,
@@ -91,6 +93,55 @@ impl Profile {
         }
         config
     }
+
+    fn headroom_db(self) -> f64 {
+        let mut peak = 0.0_f64;
+        // Sample the combined response at common Windows output rates, including
+        // the edges of the low and high shelves. Sum responses, not slider gains.
+        for sample_rate in [32_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            let nyquist = sample_rate / 2.0;
+            let centres = FREQUENCIES.map(|hz| prewarp(f64::from(hz), sample_rate));
+            for point in 0..=384 {
+                let frequency = (nyquist - 1.0).powf(f64::from(point) / 384.0);
+                let warped = prewarp(frequency, sample_rate);
+                let response: f64 = FILTER_SHAPES
+                    .into_iter()
+                    .zip(centres)
+                    .zip(self.gains)
+                    .map(|(((kind, q), centre), gain)| {
+                        filter_response_db(kind, q, warped / centre, gain)
+                    })
+                    .sum();
+                peak = peak.max(response);
+            }
+        }
+        if peak < 0.01 {
+            return 0.0;
+        }
+        (peak * 10.0).ceil() / 10.0 + 0.1
+    }
+}
+
+fn prewarp(hz: f64, sample_rate: f64) -> f64 {
+    (std::f64::consts::PI * hz / sample_rate).tan()
+}
+
+fn filter_response_db(kind: &str, q: f64, frequency_ratio: f64, gain: f32) -> f64 {
+    let a = 10.0_f64.powf(f64::from(gain) / 40.0);
+    let t = frequency_ratio;
+    let square = t * t;
+    let energy = |real: f64, imaginary: f64| real * real + imaginary * imaginary;
+    let shelf_imaginary = a.sqrt() * t / q;
+    let power_ratio = match kind {
+        "LSC" => {
+            a * a * energy(a - square, shelf_imaginary) / energy(1.0 - a * square, shelf_imaginary)
+        }
+        "HSC" => {
+            a * a * energy(1.0 - a * square, shelf_imaginary) / energy(a - square, shelf_imaginary)
+        }
+        _ => energy(1.0 - square, a * t / q) / energy(1.0 - square, t / (a * q)),
+    };
+    10.0 * power_ratio.log10()
 }
 
 fn parse_gain(value: &str) -> Option<f32> {
@@ -99,8 +150,11 @@ fn parse_gain(value: &str) -> Option<f32> {
 }
 
 fn profile_path() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("PUBLIC")?).join("Documents");
-    Some(dir.join("Kopuz System EQ.txt"))
+    let dir = windows_registry::LOCAL_MACHINE
+        .open(r"SOFTWARE\EqualizerAPO")
+        .and_then(|key| key.get_string("ConfigPath"))
+        .ok()?;
+    Some(PathBuf::from(dir).join("KopuzEQ").join("profile.txt"))
 }
 
 fn save_profile(path: &Path, profile: Profile) -> io::Result<()> {
@@ -124,11 +178,9 @@ fn save_profile(path: &Path, profile: Profile) -> io::Result<()> {
 
 #[component]
 pub(super) fn SystemEqualizer() -> Element {
-    let Some(path) = profile_path() else {
-        return rsx! {};
-    };
+    let path = profile_path();
     let mut saved = use_signal(|| {
-        fs::read_to_string(&path)
+        fs::read_to_string(path.as_ref()?)
             .ok()
             .and_then(|text| Profile::parse(text.lines().next()?))
     });
@@ -136,7 +188,7 @@ pub(super) fn SystemEqualizer() -> Element {
     let mut status = use_signal(String::new);
     let settings = *draft.read();
     let dirty = *saved.read() != Some(settings);
-    let include = format!("Include: {}", path.display());
+    let ready = path.as_ref().is_some_and(|path| path.is_file());
 
     rsx! {
         div { class: "app-card flex flex-col gap-4 p-4",
@@ -167,7 +219,7 @@ pub(super) fn SystemEqualizer() -> Element {
             div { class: "grid grid-cols-2 gap-4 md:grid-cols-3",
                 for (index, label) in LABELS.into_iter().enumerate() {
                     label { class: "flex min-w-0 flex-col gap-1 text-sm",
-                        span { "{label} · {settings.gains[index]:+.1} dB" }
+                        span { {format!("{label} · {:+.1} dB", settings.gains[index])} }
                         input {
                             r#type: "range",
                             min: "-12",
@@ -191,16 +243,16 @@ pub(super) fn SystemEqualizer() -> Element {
                         spawn(async move {
                             let mut dialog = rfd::AsyncFileDialog::new().set_title("Select Spotify's prefs file");
                             if let Some(appdata) = std::env::var_os("APPDATA") {
-                                dialog = dialog.set_directory(PathBuf::from(appdata).join("Spotify"));
+                                dialog = dialog.set_directory(PathBuf::from(appdata).join("Spotify").join("Users"));
                             }
                             if let Some(file) = dialog.pick_file().await {
                                 match fs::read_to_string(file.path()) {
                                     Ok(text) => match Profile::from_spotify(&text) {
-                                        Some(profile) => {
+                                    Some(profile) => {
                                             draft.set(profile);
                                             status.set("Spotify settings imported. Select Apply EQ to use them.".into());
                                         }
-                                        None => status.set("No supported EQ settings found in this Spotify prefs file.".into()),
+                                        None => status.set("Select the prefs file inside your Spotify account folder under Spotify/Users.".into()),
                                     },
                                     Err(error) => status.set(format!("Could not read Spotify prefs: {error}")),
                                 }
@@ -212,9 +264,10 @@ pub(super) fn SystemEqualizer() -> Element {
                 button {
                     r#type: "button",
                     class: "app-button-tonal rounded-lg px-3 py-2 text-sm",
-                    disabled: !dirty,
+                    disabled: !dirty || !ready,
                     onclick: move |_| {
-                        match save_profile(&path, settings) {
+                        let Some(path) = path.as_ref() else { return; };
+                        match save_profile(path, settings) {
                             Ok(()) => {
                                 saved.set(Some(settings));
                                 status.set("Profile saved.".into());
@@ -229,9 +282,8 @@ pub(super) fn SystemEqualizer() -> Element {
             details { class: "text-sm text-slate-400",
                 summary { "Set up Equalizer APO once" }
                 p {
-                    "Install Equalizer APO and enable it on your headphones or speakers. Select Apply EQ to create the profile, then add this line in Equalizer APO's Configuration Editor."
+                    "Install Equalizer APO, enable it on your headphones or speakers, then run setup-kopuz-eq.ps1 from this build as administrator."
                 }
-                code { class: "select-all", "{include}" }
             }
         }
     }
@@ -244,11 +296,12 @@ mod tests {
     #[test]
     fn spotify_import_round_trips_with_headroom_and_shelves() {
         let profile = Profile::from_spotify(
-            "audio.equalizer.low_shelf_gain_v2=3.0\naudio.equalizer.high_shelf_gain_v2=2.0",
+            "audio.equalizer.low_shelf_gain_v2=536870912\naudio.equalizer.high_shelf_gain_v2=357913941",
         )
         .unwrap();
         let output = profile.apo_config();
-        assert!(output.contains("Preamp: -5.000 dB"));
+        assert!((3.0..3.3).contains(&profile.headroom_db()));
+        assert!(output.contains("Preamp: -3."));
         assert!(output.contains("Filter: ON LSC Fc 60 Hz"));
         assert!(output.contains("Filter: ON HSC Fc 15000 Hz"));
         assert!(Profile::parse(output.lines().next().unwrap()) == Some(profile));
@@ -264,5 +317,16 @@ mod tests {
         let output = profile.apo_config();
         assert_eq!(output.lines().count(), 1);
         assert!(Profile::parse(output.trim_end()) == Some(profile));
+    }
+
+    #[test]
+    fn overlapping_boosts_get_headroom_without_summing_all_slider_values() {
+        let profile = Profile {
+            enabled: true,
+            gains: [12.0; 6],
+        };
+        assert!((12.0..36.0).contains(&profile.headroom_db()));
+        assert_eq!(Profile::default().headroom_db(), 0.0);
+        assert!((filter_response_db("PK", 1.0, 1.0, 6.0) - 6.0).abs() < 1e-10);
     }
 }

@@ -21,6 +21,7 @@ rfd = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tempfile = { workspace = true }
+windows-registry = { workspace = true }
 
 [dependencies]
 dioxus = { workspace = true, features = ["desktop"] }
