@@ -93,7 +93,7 @@ impl Session {
             station
                 .and_then(|station| station.streams.iter().find(|stream| stream.id == stream_id))
                 .map(|stream| (stream.url.clone(), cover))
-        } else if is_server && self.sources.server.is_some() && self.active_source.is_some() {
+        } else if is_server && self.sources.server.is_some() && self.source_for(&track).is_some() {
             let cover =
                 now_playing_artwork(self.sources.server.as_ref(), &track).unwrap_or_default();
             Some((ResolvedStreamRef::pending_marker(&item_id), cover))
@@ -252,6 +252,7 @@ impl Session {
             });
         }
 
+        let stream_source = self.source_for(&track);
         let classified = ClassifiedLoad {
             token,
             idx,
@@ -264,7 +265,7 @@ impl Session {
             local_path,
             remote_ref,
             capture,
-            active_source: self.active_source.clone(),
+            active_source: stream_source,
             stream_quality: self.settings.playback.stream_quality,
             artwork,
             transition,
@@ -466,6 +467,20 @@ impl Session {
                 // Engine-side cancellation is owned by the command that
                 // cancelled it; token guards reject any late completion.
             }
+        }
+    }
+
+    /// The source that streams `track`: the active one, or, for a track of
+    /// another service sharing the queue, that service's ready source.
+    pub(super) fn source_for(&self, track: &Track) -> Option<server::source::ActiveSource> {
+        let active = self.sources.server.as_ref().map(|server| server.service);
+        match track.id.service() {
+            Some(service) if Some(service) != active => self
+                .companions
+                .get(&service)
+                .cloned()
+                .or_else(|| self.active_source.clone()),
+            _ => self.active_source.clone(),
         }
     }
 

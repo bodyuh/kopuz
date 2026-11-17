@@ -1943,6 +1943,43 @@ impl SourceService {
     }
 
     /// Probe the active source whenever it or its server entry changes, and retry one that is not online.
+    /// Keep a ready source for every saved service that shares the queue
+    /// with the active one, so a queued SoundCloud track plays while Spotify
+    /// is browsed, and the other way round.
+    pub fn watch_companions(
+        self: &Arc<Self>,
+        mut sources: tokio::sync::watch::Receiver<Arc<Sources>>,
+    ) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let current = sources.borrow_and_update().clone();
+                let active = current.server.as_ref().map(|server| server.service);
+                let mut companions = crate::session::Companions::new();
+                for saved in &current.servers {
+                    if !crate::session::SHARED_QUEUE_SERVICES.contains(&saved.service)
+                        || Some(saved.service) == active
+                        || companions.contains_key(&saved.service)
+                    {
+                        continue;
+                    }
+                    match service.resolve(&saved.id).await {
+                        Ok((_, source)) => {
+                            companions.insert(saved.service, source);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, server = %saved.id, "could not prepare a source for the shared queue");
+                        }
+                    }
+                }
+                service.session.set_companion_sources(companions);
+                if sources.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     pub fn watch_active(self: &Arc<Self>, mut sources: tokio::sync::watch::Receiver<Arc<Sources>>) {
         let service = self.clone();
         tokio::spawn(async move {

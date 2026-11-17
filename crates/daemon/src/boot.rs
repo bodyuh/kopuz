@@ -287,6 +287,7 @@ pub async fn assemble(args: &CoreArgs) -> Result<Core, Box<dyn std::error::Error
     sources.spawn_credential_upkeep();
     sources.watch_removable();
     sources.watch_active(session.sources_watch());
+    sources.watch_companions(session.sources_watch());
     sources.watch_network();
     if args.offline {
         sources.set_offline(true);

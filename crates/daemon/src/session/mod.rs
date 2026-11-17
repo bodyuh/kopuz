@@ -204,6 +204,25 @@ async fn write_remote_queue(
 
 pub type FactoryOverride = Arc<dyn Fn(&Track) -> Option<SourceFactory> + Send + Sync>;
 
+/// Streaming services whose tracks can sit in one queue: whichever is
+/// browsed, each track plays through its own service.
+pub(crate) const SHARED_QUEUE_SERVICES: [config::MusicService; 2] = [
+    config::MusicService::Spotify,
+    config::MusicService::SoundCloud,
+];
+
+/// A ready source per service sharing the queue, beside the active one.
+pub(crate) type Companions =
+    std::collections::HashMap<config::MusicService, server::source::ActiveSource>;
+
+/// Whether `sources` has a shared-queue service active.
+fn shares_queue(sources: &server::sources::Sources) -> bool {
+    sources
+        .server
+        .as_ref()
+        .is_some_and(|server| SHARED_QUEUE_SERVICES.contains(&server.service))
+}
+
 enum SessionCmd {
     Player(PlayerCommand, oneshot::Sender<Result<CommandAck, ApiError>>),
     Edit(QueueEdit, oneshot::Sender<Result<CommandAck, ApiError>>),
@@ -260,6 +279,7 @@ enum SessionCmd {
     ExternalArtworkFetched(String),
     SetStationRegistry(Arc<radio::registry::StationRegistry>),
     SetActiveSource(Option<server::source::ActiveSource>),
+    SetCompanionSources(Companions),
     ClearError,
     QueueMirror(oneshot::Sender<QueueMirrorSnapshot>),
     Persist(oneshot::Sender<()>),
@@ -386,6 +406,7 @@ impl SessionHandle {
             sources_tx,
             sources: services.sources,
             active_source: services.active_source,
+            companions: Companions::default(),
             station_registry: services.station_registry,
             queue_stations: Default::default(),
             offline: services.offline.clone(),
@@ -612,6 +633,14 @@ impl SessionHandle {
         let _ = self.cmd_tx.send(SessionCmd::SetActiveSource(source));
     }
 
+    /// Hand over a ready source for each other service sharing the queue, so
+    /// a queued track from it plays without switching to it.
+    pub fn set_companion_sources(&self, companions: Companions) {
+        let _ = self
+            .cmd_tx
+            .send(SessionCmd::SetCompanionSources(companions));
+    }
+
     /// The whole queue in play order plus its permutation, behind `queue_snapshot`.
     pub(crate) async fn queue_mirror(&self) -> QueueMirrorSnapshot {
         let (tx, rx) = oneshot::channel();
@@ -822,6 +851,8 @@ struct Session {
     sources_tx: watch::Sender<Arc<server::sources::Sources>>,
     sources: Arc<server::sources::Sources>,
     active_source: Option<server::source::ActiveSource>,
+    /// Ready sources for the other services that share the queue.
+    companions: Companions,
     station_registry: Arc<radio::registry::StationRegistry>,
     /// The records of queued stations the registry may no longer list.
     queue_stations: std::collections::HashMap<String, radio::manifest::StationManifest>,
@@ -928,7 +959,10 @@ impl Session {
                 revision,
             } => self.apply_settings(*settings, changed, revision, state_tx),
             SessionCmd::SetSources { sources, adopted } => {
-                if sources.active != self.sources.active {
+                // Streaming services that share one queue keep it across a
+                // switch between them; only the browsed library changes.
+                let shared = shares_queue(&self.sources) && shares_queue(&sources);
+                if sources.active != self.sources.active && !shared {
                     self.swap_queue(&sources, state_tx).await;
                 }
                 self.sources = sources;
@@ -973,6 +1007,7 @@ impl Session {
                 self.station_registry = registry;
             }
             SessionCmd::SetActiveSource(source) => self.active_source = source,
+            SessionCmd::SetCompanionSources(companions) => self.companions = companions,
             SessionCmd::ClearError => {
                 self.error = None;
                 self.publish(state_tx, false);
