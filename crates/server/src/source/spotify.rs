@@ -75,7 +75,9 @@ impl MediaSource for SpotifySource {
             radio: RadioSeeds::NONE,
             play_queue: false,
             playlists: PlaylistOps::None,
-            artist_view: ArtistView::Library,
+            // An artist opens on Spotify's own page (popular, albums,
+            // singles), not just the tracks the library happens to hold.
+            artist_view: ArtistView::Remote,
             albums: AlbumType::Standard,
             favorites_sync: FavoritesSync::Paginated,
             account_avatar: false,
@@ -147,6 +149,16 @@ impl MediaSource for SpotifySource {
     ) -> Result<(Vec<reader::Track>, Vec<reader::Album>), SourceError> {
         let token = self.token()?;
         crate::spotify::api::search(token, query)
+            .await
+            .map_err(SourceError::from)
+    }
+
+    async fn fetch_artist(
+        &self,
+        channel_id: &str,
+    ) -> Result<crate::ytmusic::discover::YtArtist, SourceError> {
+        let token = self.token()?;
+        crate::spotify::api::artist_page(token, channel_id)
             .await
             .map_err(SourceError::from)
     }

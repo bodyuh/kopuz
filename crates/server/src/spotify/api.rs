@@ -503,6 +503,205 @@ pub async fn discover_home(access: &str) -> Result<crate::ytmusic::discover::Dis
     })
 }
 
+/// Whether `text` is a Spotify id (22 base-62 characters) rather than a name.
+fn is_spotify_id(text: &str) -> bool {
+    text.len() == 22 && text.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// An artist's page, as the catalog shows one: popular tracks, then albums,
+/// singles and EPs, and releases they appear on. `artist` is the Spotify id,
+/// or a name, which is looked up first.
+pub async fn artist_page(
+    access: &str,
+    artist: &str,
+) -> Result<crate::ytmusic::discover::YtArtist, String> {
+    use crate::ytmusic::discover::{DiscoverItem, DiscoverShelf, ShelfLayout, YtArtist};
+
+    let artist_id = if is_spotify_id(artist) {
+        artist.to_string()
+    } else {
+        let found = get_json(
+            access,
+            &format!("{API}/search"),
+            &[
+                ("q", artist.to_string()),
+                ("type", "artist".to_string()),
+                ("limit", "1".to_string()),
+            ],
+            "artist search",
+        )
+        .await?;
+        found["artists"]["items"][0]["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("Spotify has no artist named {artist}"))?
+    };
+
+    let profile = get_json(
+        access,
+        &format!("{API}/artists/{artist_id}"),
+        &[],
+        "artist",
+    )
+    .await?;
+    let name = profile["name"].as_str().unwrap_or_default().to_string();
+
+    let shelf = |title: &str, items: Vec<DiscoverItem>, layout: ShelfLayout| DiscoverShelf {
+        title: title.to_string(),
+        strapline: None,
+        more: None,
+        items,
+        layout,
+        continuation: None,
+        search_filter: None,
+    };
+    let songs = |tracks: Vec<Track>| -> Vec<DiscoverItem> {
+        tracks
+            .into_iter()
+            .map(|track| DiscoverItem::Song(Box::new(track), Default::default()))
+            .collect()
+    };
+
+    let mut sections = Vec::new();
+
+    let mut popular: Vec<Track> = match get_json(
+        access,
+        &format!("{API}/artists/{artist_id}/top-tracks"),
+        &[("market", "from_token".to_string())],
+        "artist top tracks",
+    )
+    .await
+    {
+        Ok(body) => body["tracks"]
+            .as_array()
+            .map(|items| items.iter().filter_map(parse_track).collect())
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%error, "spotify artist top tracks unavailable; searching instead");
+            Vec::new()
+        }
+    };
+    if popular.is_empty() && !name.is_empty() {
+        let found = get_json(
+            access,
+            &format!("{API}/search"),
+            &[
+                ("q", format!("artist:\"{name}\"")),
+                ("type", "track".to_string()),
+                ("limit", "10".to_string()),
+            ],
+            "artist track search",
+        )
+        .await;
+        if let Ok(body) = found {
+            popular = body["tracks"]["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(parse_track)
+                        .filter(|track| {
+                            track
+                                .credits
+                                .iter()
+                                .any(|credit| credit.id.as_deref() == Some(artist_id.as_str()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+    }
+    if !popular.is_empty() {
+        sections.push(shelf("Popular", songs(popular), ShelfLayout::List));
+    }
+
+    let mut albums = Vec::new();
+    let mut singles = Vec::new();
+    let mut appears = Vec::new();
+    let mut offset = 0u32;
+    let mut limit = 50u32;
+    while offset < 200 {
+        let page = get_json(
+            access,
+            &format!("{API}/artists/{artist_id}/albums"),
+            &[
+                ("include_groups", "album,single,appears_on".to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ],
+            "artist albums",
+        )
+        .await;
+        let body = match page {
+            Ok(body) => body,
+            // Some apps may only ask for small pages.
+            Err(error) if limit > 10 && error.contains("400") => {
+                limit = 10;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "spotify artist albums unavailable");
+                break;
+            }
+        };
+        let items = body["items"].as_array().cloned().unwrap_or_default();
+        let count = items.len();
+        for item in items {
+            let Some(id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let year = item["release_date"]
+                .as_str()
+                .and_then(|date| date.get(..4))
+                .unwrap_or_default()
+                .to_string();
+            let entry = DiscoverItem::Album {
+                browse_id: id.to_string(),
+                title: item["name"].as_str().unwrap_or_default().to_string(),
+                subtitle: year,
+                thumbnail: first_image(&item["images"]),
+                actions: Default::default(),
+                explicit: false,
+            };
+            match (
+                item["album_group"].as_str(),
+                item["album_type"].as_str(),
+            ) {
+                (Some("appears_on"), _) => appears.push(entry),
+                (_, Some("album")) => albums.push(entry),
+                _ => singles.push(entry),
+            }
+        }
+        if count < limit as usize || body["next"].is_null() {
+            break;
+        }
+        offset += limit;
+    }
+    if !albums.is_empty() {
+        sections.push(shelf("Albums", albums, ShelfLayout::Grid));
+    }
+    if !singles.is_empty() {
+        sections.push(shelf("Singles & EPs", singles, ShelfLayout::Grid));
+    }
+    if !appears.is_empty() {
+        sections.push(shelf("Appears on", appears, ShelfLayout::Carousel));
+    }
+
+    let followers = profile["followers"]["total"].as_u64();
+    Ok(YtArtist {
+        channel_id: artist_id,
+        name,
+        subscribers: followers.map(|total| format!("{total} followers")),
+        monthly_listeners: None,
+        description: None,
+        banner_thumbnail: first_image(&profile["images"]),
+        shuffle_ref: None,
+        mix_ref: None,
+        sections,
+        actions: Default::default(),
+    })
+}
+
 /// Saved albums with their tracks, for the library sync snapshot.
 pub async fn saved_albums(access: &str) -> Result<(Vec<reader::Album>, Vec<Track>), String> {
     let mut albums = Vec::new();

@@ -57,7 +57,9 @@ impl MediaSource for SoundcloudSource {
             play_queue: false,
             // No write side wired (api-v2 playlist mutation is DataDome-gated).
             playlists: PlaylistOps::None,
-            artist_view: ArtistView::Library,
+            // An artist opens on their SoundCloud page (popular and posted
+            // tracks), not just the tracks the library happens to hold.
+            artist_view: ArtistView::Remote,
             albums: AlbumType::Standard,
             favorites_sync: FavoritesSync::Paginated,
             account_avatar: false,
@@ -150,6 +152,15 @@ impl MediaSource for SoundcloudSource {
     ) -> Result<(Vec<reader::Track>, Vec<reader::Album>), SourceError> {
         let tracks = crate::soundcloud::search_tracks(query).await?;
         Ok((tracks, Vec::new()))
+    }
+
+    async fn fetch_artist(
+        &self,
+        channel_id: &str,
+    ) -> Result<crate::ytmusic::discover::YtArtist, SourceError> {
+        crate::soundcloud::artist_page(channel_id, self.token.as_deref())
+            .await
+            .map_err(SourceError::from)
     }
 
     async fn fetch_playlists(&self) -> Result<Vec<PlaylistMeta>, SourceError> {

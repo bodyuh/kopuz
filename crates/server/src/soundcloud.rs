@@ -442,6 +442,118 @@ async fn auth_get_json(
         .map_err(|e| format!("SoundCloud API JSON: {}", e.without_url()))
 }
 
+/// A SoundCloud user's page, as the catalog shows an artist: their popular
+/// tracks, then everything they posted. `user` is the numeric user id, or a
+/// name, which is looked up first.
+pub(crate) async fn artist_page(
+    user: &str,
+    token: Option<&str>,
+) -> Result<crate::ytmusic::discover::YtArtist, String> {
+    use crate::ytmusic::discover::{DiscoverItem, DiscoverShelf, ShelfLayout, YtArtist};
+
+    let http = http_client();
+    let mut cid = client_id(&http, false).await?;
+    let user_id = if !user.is_empty() && user.bytes().all(|byte| byte.is_ascii_digit()) {
+        user.to_string()
+    } else {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{API_V2}/search/users"),
+            &[("q", user), ("client_id", cid.as_str()), ("limit", "1")],
+        )
+        .map_err(|error| error.to_string())?;
+        let found = auth_get_json(&http, url.as_str(), token).await?;
+        found["collection"][0]["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .ok_or_else(|| format!("SoundCloud has no artist named {user}"))?
+    };
+    let profile_url = |cid: &str| format!("{API_V2}/users/{user_id}?client_id={cid}");
+    let profile = match auth_get_json(&http, &profile_url(&cid), token).await {
+        Ok(profile) => profile,
+        Err(_) => {
+            // The scraped client id rotates; one fresh scrape before giving up.
+            cid = client_id(&http, true).await?;
+            auth_get_json(&http, &profile_url(&cid), token).await?
+        }
+    };
+    let name = profile["username"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let tracks_of = |json: &Value| -> Vec<Track> {
+        json["collection"]
+            .as_array()
+            .map(|items| items.iter().filter_map(parse_track).collect())
+            .unwrap_or_default()
+    };
+    let songs = |tracks: Vec<Track>| -> Vec<DiscoverItem> {
+        tracks
+            .into_iter()
+            .map(|track| DiscoverItem::Song(Box::new(track), Default::default()))
+            .collect()
+    };
+    let shelf = |title: &str, items: Vec<DiscoverItem>| DiscoverShelf {
+        title: title.to_string(),
+        strapline: None,
+        more: None,
+        items,
+        layout: ShelfLayout::List,
+        continuation: None,
+        search_filter: None,
+    };
+
+    let mut sections = Vec::new();
+    match auth_get_json(
+        &http,
+        &format!("{API_V2}/users/{user_id}/toptracks?client_id={cid}&limit=10"),
+        token,
+    )
+    .await
+    {
+        Ok(json) => {
+            let popular = tracks_of(&json);
+            if !popular.is_empty() {
+                sections.push(shelf("Popular", songs(popular)));
+            }
+        }
+        Err(error) => tracing::warn!(%error, "SoundCloud popular tracks unavailable"),
+    }
+    match auth_get_json(
+        &http,
+        &format!("{API_V2}/users/{user_id}/tracks?client_id={cid}&limit=50&linked_partitioning=1"),
+        token,
+    )
+    .await
+    {
+        Ok(json) => {
+            let posted = tracks_of(&json);
+            if !posted.is_empty() {
+                sections.push(shelf("Tracks", songs(posted)));
+            }
+        }
+        Err(error) => tracing::warn!(%error, "SoundCloud user tracks unavailable"),
+    }
+
+    Ok(YtArtist {
+        channel_id: user_id,
+        name,
+        subscribers: profile["followers_count"]
+            .as_u64()
+            .map(|count| format!("{count} followers")),
+        monthly_listeners: None,
+        description: None,
+        banner_thumbnail: profile["avatar_url"]
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .map(upscale_artwork),
+        shuffle_ref: None,
+        mix_ref: None,
+        sections,
+        actions: Default::default(),
+    })
+}
+
 /// Fetch the signed-in user's profile (`/me`).
 pub(crate) async fn get_me(token: &str) -> Result<Value, String> {
     let http = http_client();
