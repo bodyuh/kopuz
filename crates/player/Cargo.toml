@@ -71,6 +71,7 @@ windows = { workspace = true, features = [
   "Win32_System_Variant",
   "Win32_Media_Audio",
   "Win32_Security",
+  "Win32_UI_Shell_PropertiesSystem",
 ] }
 tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, features = ["blocking"] }

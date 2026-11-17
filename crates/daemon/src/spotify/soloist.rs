@@ -169,7 +169,27 @@ impl Soloist {
         let volume = self.volume.clone();
         let mut output: Option<EqOutput> = None;
         let mut settings = Some(settings);
+        let silent_output = silent_output(&home);
+        let mut routed = false;
+        let mut next_route = Instant::now();
         let capture = ProcessCapture::start(pid, move |samples| {
+            // Windows takes Soloist's output preference only once it has
+            // opened a stream, so it is set when its first audio arrives.
+            if !routed
+                && Instant::now() >= next_route
+                && samples.iter().any(|sample| *sample != 0.0)
+            {
+                match loopback::route_output(pid, &silent_output) {
+                    Ok(device) => {
+                        tracing::info!(%device, "Soloist plays to an unheard output");
+                        routed = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not move Soloist off the speakers");
+                        next_route = Instant::now() + Duration::from_secs(10);
+                    }
+                }
+            }
             let output = output.get_or_insert_with(|| {
                 EqOutput::new(
                     settings.take().expect("output is built once"),
@@ -238,6 +258,16 @@ fn home() -> Result<PathBuf, ApiError> {
         ApiError::internal(format!("Could not create {}: {error}", home.display()))
     })?;
     Ok(home)
+}
+
+/// The output Soloist renders to so that only Kopuz's copy is heard: the
+/// name in `output-device.txt`, else "Digital Output".
+fn silent_output(home: &std::path::Path) -> String {
+    std::fs::read_to_string(home.join("output-device.txt"))
+        .ok()
+        .map(|name| name.trim().trim_start_matches('\u{feff}').trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Digital Output".to_string())
 }
 
 /// The Soloist API key: `SOLOIST_API_KEY`, or `api-key.txt` next to the exe.
@@ -406,10 +436,22 @@ impl EqOutput {
                 let capacity = config.channels * (config.sample_rate as usize / 8);
                 let (producer, mut consumer) = rtrb::RingBuffer::new(capacity);
                 let _ = producer_tx.send(producer);
+                // The capture arrives in uneven packets; playing only once
+                // about 50 ms is queued keeps a late packet from becoming a
+                // gap, and an underrun waits for that cushion again.
+                let cushion = config.channels * (config.sample_rate as usize / 20);
+                let mut primed = false;
                 Box::new(move |output| {
                     output.fill(0.0);
+                    if !primed {
+                        if consumer.slots() < cushion {
+                            return;
+                        }
+                        primed = true;
+                    }
                     for frame in output.chunks_exact_mut(config.channels) {
                         if consumer.slots() < frame.len() {
+                            primed = false;
                             break;
                         }
                         for sample in frame {

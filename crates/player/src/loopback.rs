@@ -30,6 +30,132 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{HRESULT, IUnknown, Interface, Ref, w};
 use windows_core::implement;
 
+/// Windows' per-app output preference, as the volume mixer sets it. Not a
+/// documented API; the layout is the one Windows 10 21H2 and later use.
+#[windows_core::interface("ab3d4648-e242-459f-b02f-541c70306324")]
+unsafe trait IAudioPolicyConfigFactory: IUnknown {
+    // IInspectable
+    fn GetIids(&self) -> HRESULT;
+    fn GetRuntimeClassName(&self) -> HRESULT;
+    fn GetTrustLevel(&self) -> HRESULT;
+    // Volume groups, ringer and chat-app methods this module never calls.
+    fn Unused01(&self) -> HRESULT;
+    fn Unused02(&self) -> HRESULT;
+    fn Unused03(&self) -> HRESULT;
+    fn Unused04(&self) -> HRESULT;
+    fn Unused05(&self) -> HRESULT;
+    fn Unused06(&self) -> HRESULT;
+    fn Unused07(&self) -> HRESULT;
+    fn Unused08(&self) -> HRESULT;
+    fn Unused09(&self) -> HRESULT;
+    fn Unused10(&self) -> HRESULT;
+    fn Unused11(&self) -> HRESULT;
+    fn Unused12(&self) -> HRESULT;
+    fn Unused13(&self) -> HRESULT;
+    fn Unused14(&self) -> HRESULT;
+    fn Unused15(&self) -> HRESULT;
+    fn Unused16(&self) -> HRESULT;
+    fn Unused17(&self) -> HRESULT;
+    fn Unused18(&self) -> HRESULT;
+    fn Unused19(&self) -> HRESULT;
+    fn SetPersistedDefaultAudioEndpoint(
+        &self,
+        pid: u32,
+        flow: i32,
+        role: i32,
+        device: *mut std::ffi::c_void,
+    ) -> HRESULT;
+}
+
+/// Send the audio of `pid` to the active output whose name contains
+/// `device`, the way the volume mixer's per-app output does. Windows only
+/// accepts this once the process has opened an audio stream, and remembers
+/// it for that executable. Call on a thread with COM initialized.
+pub fn route_output(pid: u32, device: &str) -> Result<String, String> {
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Media::Audio::{
+        DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
+    };
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
+    use windows::Win32::System::WinRT::RoGetActivationFactory;
+    use windows::core::{GUID, HSTRING};
+
+    #[repr(C)]
+    struct RawString {
+        vt: u16,
+        reserved: [u16; 3],
+        text: *const u16,
+    }
+    const VT_LPWSTR: u16 = 31;
+    const FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+        pid: 14,
+    };
+
+    let wanted = device.to_lowercase();
+    // SAFETY: COM calls on interfaces that live for this block; the id
+    // string is freed with CoTaskMemFree as the API requires.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+        let devices = enumerator
+            .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+            .map_err(|e| e.to_string())?;
+        let count = devices.GetCount().map_err(|e| e.to_string())?;
+        let mut found = None;
+        for index in 0..count {
+            let Ok(endpoint) = devices.Item(index) else {
+                continue;
+            };
+            let Ok(store) = endpoint.OpenPropertyStore(STGM_READ) else {
+                continue;
+            };
+            let Ok(value) = store.GetValue(&FRIENDLY_NAME) else {
+                continue;
+            };
+            let raw = &*(&raw const value).cast::<RawString>();
+            if raw.vt != VT_LPWSTR || raw.text.is_null() {
+                continue;
+            }
+            let mut len = 0;
+            while *raw.text.add(len) != 0 {
+                len += 1;
+            }
+            let name = String::from_utf16_lossy(std::slice::from_raw_parts(raw.text, len));
+            if !name.to_lowercase().contains(&wanted) {
+                continue;
+            }
+            let Ok(id) = endpoint.GetId() else {
+                continue;
+            };
+            let text = id.to_string();
+            CoTaskMemFree(Some(id.0 as *const std::ffi::c_void));
+            if let Ok(text) = text {
+                found = Some((name, text));
+                break;
+            }
+        }
+        let Some((name, id)) = found else {
+            return Err(format!("no active output named like \"{device}\""));
+        };
+        let factory: IAudioPolicyConfigFactory =
+            RoGetActivationFactory(&HSTRING::from("Windows.Media.Internal.AudioPolicyConfig"))
+                .map_err(|e| e.to_string())?;
+        let full = HSTRING::from(format!(
+            r"\\?\SWD#MMDEVAPI#{id}#{{e6327cad-dcec-4949-ae8a-991e976a79d2}}"
+        ));
+        let handle: *mut std::ffi::c_void = std::mem::transmute_copy(&full);
+        // eRender = 0; eConsole = 0, eMultimedia = 1.
+        for role in [0, 1] {
+            factory
+                .SetPersistedDefaultAudioEndpoint(pid, 0, role, handle)
+                .ok()
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(name)
+    }
+}
+
 /// The rate and layout every capture is converted to.
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
