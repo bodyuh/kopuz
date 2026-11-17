@@ -180,7 +180,7 @@ async fn connect(
         ApiError::internal(format!("Could not open Spotify sign-in storage: {error}"))
     })?;
     let client = SessionConfig::default();
-    let mut connection = Session::new(client.clone(), Some(cache.clone()));
+    let mut connection = new_session(client.clone(), Some(cache.clone()));
     let mut authorized = false;
     if let Some(credentials) = cache.credentials()
         && credentials.username.as_deref() == Some(account.as_str())
@@ -200,7 +200,7 @@ async fn connect(
                 ) =>
             {
                 connection.shutdown();
-                connection = Session::new(client.clone(), Some(cache.clone()));
+                connection = new_session(client.clone(), Some(cache.clone()));
             }
             Ok(Err(error)) => {
                 return Err(ApiError::internal(format!(
@@ -271,6 +271,23 @@ async fn connect(
         events,
         account,
     })
+}
+
+fn new_session(config: SessionConfig, cache: Option<Cache>) -> Session {
+    // Kopuz and librespot enable different rustls providers. The native
+    // session uses a TLS client that asks rustls for the process default.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Session::new(config, cache)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn native_session_initializes_tls() {
+        let session = super::new_session(librespot_core::SessionConfig::default(), None);
+        assert!(!session.is_invalid());
+        session.shutdown();
+    }
 }
 
 fn report(app: &SessionHandle, request: &Mutex<Option<RequestedTrack>>, event: PlayerEvent) {
