@@ -499,7 +499,7 @@ pub fn settings(server: &ServerView<'_>, config: &Settings) -> Vec<FieldSpec> {
             },
             browser_field(browser.as_deref(), None),
         ],
-        MusicService::Spotify => {
+        MusicService::Spotify if !cfg!(windows) => {
             let mut hosts = vec![ChoiceOption {
                 value: AUTOMATIC.to_string(),
                 label: Text::key("playback_browser_auto"),

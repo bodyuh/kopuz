@@ -389,7 +389,10 @@ impl Sink for Output {
         let lost = Arc::new(AtomicBool::new(false));
         let failure_flag = lost.clone();
         let mut sink = CpalSink::try_new(move |event| {
-            if matches!(event, SinkEvent::DeviceLost | SinkEvent::StreamStalled) {
+            if matches!(
+                event,
+                SinkEvent::DeviceLost | SinkEvent::StreamStalled | SinkEvent::DefaultDeviceChanged
+            ) {
                 failure_flag.store(true, Ordering::Relaxed);
             }
         })
@@ -404,8 +407,14 @@ impl Sink for Output {
                     let (producer, mut consumer) = rtrb::RingBuffer::new(capacity);
                     let _ = producer_tx.send((producer, capacity));
                     Box::new(move |output| {
-                        for sample in output {
-                            *sample = consumer.pop().unwrap_or(0.0);
+                        output.fill(0.0);
+                        for frame in output.chunks_exact_mut(config.channels) {
+                            if consumer.slots() < frame.len() {
+                                break;
+                            }
+                            for sample in frame {
+                                *sample = consumer.pop().unwrap_or(0.0);
+                            }
                         }
                     })
                 }),
