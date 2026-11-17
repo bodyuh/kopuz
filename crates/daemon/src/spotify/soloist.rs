@@ -131,6 +131,7 @@ impl Soloist {
                 ApiError::internal(format!("Could not create {}: {error}", dir.display()))
             })?;
         }
+        stop_stale(&data);
         let log = File::create(home.join("soloist.log")).map_err(|error| {
             ApiError::internal(format!("Could not open the Soloist log: {error}"))
         })?;
@@ -196,6 +197,37 @@ impl Soloist {
     }
 }
 
+/// Soloist allows one process per data directory. A Soloist left over from a
+/// crash or started by hand would hold it, and the fresh one would exit while
+/// Kopuz drove the old one without hearing it, so the old one is stopped.
+fn stop_stale(data: &std::path::Path) {
+    let Ok(pid) = std::fs::read_to_string(data.join("soloist.pid")) else {
+        return;
+    };
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return;
+    };
+    let listed = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let is_soloist = listed.is_ok_and(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("\"soloist.exe\"")
+    });
+    if !is_soloist {
+        return;
+    }
+    tracing::info!(pid, "stopping a Soloist left running on Kopuz's data folder");
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    // Give the process a moment to release its lock file.
+    std::thread::sleep(Duration::from_millis(500));
+}
+
 /// `%LOCALAPPDATA%\kopuz\kopuz\data\soloist`, where soloist.exe, its key and
 /// its state live.
 fn home() -> Result<PathBuf, ApiError> {
@@ -250,7 +282,11 @@ async fn find_device(access: &str, child: &mut Child) -> Result<String, ApiError
                     .into_iter()
                     .find(|device| device.name == DEVICE_NAME)
                 {
-                    return Ok(device.id);
+                    // Spotify may still list a device that another process
+                    // owns; only one this Kopuz started and still runs counts.
+                    if child.try_wait().is_ok_and(|status| status.is_none()) {
+                        return Ok(device.id);
+                    }
                 }
             }
             Err(error) => tracing::debug!(%error, "spotify devices poll failed"),

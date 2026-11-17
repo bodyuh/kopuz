@@ -227,7 +227,7 @@ impl SpotifySink {
                 Ok(Some(state)) => state,
                 Ok(None) => continue,
                 Err(error) => {
-                    tracing::debug!(%error, "spotify player state poll failed");
+                    tracing::warn!(%error, "spotify player state poll failed");
                     continue;
                 }
             };

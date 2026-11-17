@@ -631,6 +631,11 @@ pub async fn transfer_playback(
         .send()
         .await
         .map_err(SourceError::from_request)?;
+    // Player commands answer with an empty or non-JSON body on success, so
+    // only the status counts.
+    if resp.status().is_success() {
+        return Ok(());
+    }
     checked_json(resp, "transfer playback").await.map(|_| ())
 }
 
@@ -643,6 +648,9 @@ async fn player_put(access: &str, path: &str, query: &[(&str, String)]) -> Resul
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
     ok_json(resp, path).await.map(|_| ())
 }
 
