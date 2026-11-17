@@ -27,7 +27,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-use windows::core::{HRESULT, IUnknown, Interface, Ref, w};
+use windows::core::{HRESULT, IUnknown, IUnknown_Vtbl, Interface, Ref, w};
 use windows_core::implement;
 
 /// Windows' per-app output preference, as the volume mixer sets it. Not a
