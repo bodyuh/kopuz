@@ -311,6 +311,12 @@ fn SongListShelf(
         .map(|(idx, _)| idx)
         .collect();
     let keys = keys_of(&songs);
+    // A list by one artist (an artist's Popular) says so once in the header;
+    // each row shows its play count there instead, where the source has one.
+    let one_artist = songs.len() > 1
+        && songs
+            .iter()
+            .all(|song| !song.artist.is_empty() && song.artist == songs[0].artist);
     // Each song's place in the queue the list plays, skipping the rows that are not songs.
     let positions: Vec<usize> = shelf
         .items
@@ -353,6 +359,7 @@ fn SongListShelf(
                                     },
                                     track: info,
                                     cover_url,
+                                    show_plays: one_artist,
                                     row_num: Some(position + 1),
                                     is_menu_open,
                                     is_currently_playing: is_current,

@@ -58,7 +58,15 @@ pub fn TrackRow(
     #[props(default = None)] row_num: Option<usize>,
     #[props(default)] catalog_actions: Option<api::CatalogActions>,
     #[props(default)] on_catalog_actions: Option<EventHandler<api::CatalogActions>>,
+    /// Show the play count where the artist goes, on a list by one artist.
+    #[props(default = false)]
+    show_plays: bool,
 ) -> Element {
+    // The second line: the artist, or on one artist's list its play count.
+    let byline = match (show_plays, track.plays.as_deref()) {
+        (true, Some(plays)) if !plays.is_empty() => plays.to_string(),
+        _ => track.artist.clone(),
+    };
     let settings = use_context::<Signal<Settings>>();
     let nav_ctrl = use_context::<NavigationController>();
     let is_vaxry = settings.read().ui.ui_style == UiStyle::Vaxry;
@@ -183,7 +191,7 @@ pub fn TrackRow(
                         }
                     }
                     span { class: "text-[11px] text-white/45 truncate leading-tight",
-                        span { dir: "auto", "{track.artist}" }
+                        span { dir: "auto", "{byline}" }
                         if !duration_str.is_empty() {
                             " • "
                             span { dir: "ltr", "{duration_str}" }
@@ -389,7 +397,7 @@ pub fn TrackRow(
                             }
                         },
                         ondoubleclick: move |evt| evt.stop_propagation(),
-                        "{track.artist}"
+                        "{byline}"
                     }
                 }
 
@@ -651,7 +659,7 @@ pub fn TrackRow(
                         }
                     },
                     ondoubleclick: move |evt| evt.stop_propagation(),
-                    "{track.artist}"
+                    "{byline}"
                 }
             }
 

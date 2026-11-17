@@ -413,9 +413,30 @@ fn parse_track(item: &Value) -> Option<Track> {
         },
         replay_gain: config::ReplayGainInfo::default(),
         explicit: false,
-        plays: None,
+        plays: item
+            .get("playback_count")
+            .and_then(|v| v.as_u64())
+            .map(|count| format!("{} plays", short_count(count))),
         counterpart: None,
     })
+}
+
+/// A count as a listing writes one: 950, 12K, 3.4M, 1.2B.
+fn short_count(count: u64) -> String {
+    let scaled = |value: f64, unit: &str| {
+        if value < 10.0 {
+            let text = format!("{value:.1}");
+            format!("{}{unit}", text.trim_end_matches(".0"))
+        } else {
+            format!("{}{unit}", value.floor() as u64)
+        }
+    };
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => scaled(count as f64 / 1e3, "K"),
+        1_000_000..=999_999_999 => scaled(count as f64 / 1e6, "M"),
+        _ => scaled(count as f64 / 1e9, "B"),
+    }
 }
 
 /// A SoundCloud playlist as listed in the user's library — enough to seed a
