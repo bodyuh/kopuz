@@ -18,6 +18,8 @@ pub use actor::EngineHandle;
 pub use sink::{
     AudioSink, CpalSink, DataCallback, DataCallbackFactory, NullSink, SinkConfig, SinkEvent,
 };
+#[cfg(windows)]
+pub use worker::{convert_channels, resample};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

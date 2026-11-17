@@ -666,7 +666,12 @@ fn audio_buf_to_f32_interleaved<'a>(
     }
 }
 
-fn convert_channels(samples: &[f32], src_channels: usize, dst_channels: usize, out: &mut Vec<f32>) {
+pub fn convert_channels(
+    samples: &[f32],
+    src_channels: usize,
+    dst_channels: usize,
+    out: &mut Vec<f32>,
+) {
     let frames = samples.len() / src_channels;
     out.clear();
     out.reserve(frames * dst_channels);
@@ -685,7 +690,13 @@ fn convert_channels(samples: &[f32], src_channels: usize, dst_channels: usize, o
     }
 }
 
-fn resample(samples: &[f32], channels: usize, src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {
+pub fn resample(
+    samples: &[f32],
+    channels: usize,
+    src_rate: u32,
+    dst_rate: u32,
+    out: &mut Vec<f32>,
+) {
     out.clear();
     if channels == 0 || src_rate == 0 || dst_rate == 0 {
         out.extend_from_slice(samples);

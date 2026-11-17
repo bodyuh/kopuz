@@ -42,6 +42,11 @@ serde_json = { workspace = true }
 directories = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+librespot-core = { git = "https://github.com/crmne/librespot", rev = "8ba22cd44168155b490e56aba80875771f27b75c", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-playback = { git = "https://github.com/crmne/librespot", rev = "8ba22cd44168155b490e56aba80875771f27b75c", default-features = false, features = ["rustls-tls-native-roots"] }
+rtrb = { workspace = true }
+
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }
 

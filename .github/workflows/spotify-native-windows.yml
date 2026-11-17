@@ -1,0 +1,45 @@
+name: Native Spotify playback for Windows
+
+on:
+  push:
+    branches: [spotify-native-windows]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spotify-native-windows
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa
+      - name: Install Dioxus CLI
+        run: cargo binstall dioxus-cli@0.7.9 -y --force --disable-strategies compile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add Cargo bin to PATH
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          Join-Path $cargoHome "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build CSS
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npx @tailwindcss/cli -i ./tailwind.css -o ./crates/kopuz/assets/tailwind.css
+      - name: Build native Spotify installer
+        run: dx bundle --release --platform desktop --package kopuz --package-types msi --out-dir bundle-msi --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kopuz-Native-Spotify-Windows
+          path: bundle-msi/*.msi
+          if-no-files-found: error

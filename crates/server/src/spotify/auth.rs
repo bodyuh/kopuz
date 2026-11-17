@@ -58,6 +58,30 @@ pub async fn authorize_with(
     client_id: String,
     open: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<SpotifyAuth, String> {
+    authorize(client_id, REDIRECT_URI, "/callback", SCOPES, open).await
+}
+
+/// The native Spotify session needs a separate streaming-only grant.
+#[cfg(windows)]
+pub async fn authorize_native_playback(client_id: String) -> Result<String, String> {
+    let token = authorize(
+        client_id,
+        "http://127.0.0.1:8898/login",
+        "/login",
+        "streaming",
+        |url| webbrowser::open(url).map_err(|error| format!("couldn't open the browser: {error}")),
+    )
+    .await?;
+    Ok(token.access_token)
+}
+
+async fn authorize(
+    client_id: String,
+    redirect: &'static str,
+    callback: &'static str,
+    scopes: &str,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<SpotifyAuth, String> {
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("Enter your Spotify app Client ID first".to_string());
@@ -71,12 +95,12 @@ pub async fn authorize_with(
         "{AUTH_URL}?client_id={cid}&response_type=code&redirect_uri={redir}\
          &code_challenge_method=S256&code_challenge={challenge}&scope={scope}&state={state}",
         cid = urlencode(&client_id),
-        redir = urlencode(REDIRECT_URI),
-        scope = urlencode(SCOPES),
+        redir = urlencode(redirect),
+        scope = urlencode(scopes),
     );
 
     let listener = std::net::TcpListener::bind(("127.0.0.1", REDIRECT_PORT)).map_err(|e| {
-        format!("couldn't bind {REDIRECT_URI} (is it registered / is the port free?): {e}")
+        format!("couldn't bind {redirect}. Finish the open Spotify sign-in or retry after it closes: {e}")
     })?;
     open(&auth_url)?;
 
@@ -90,22 +114,26 @@ pub async fn authorize_with(
 
     let _cancel = CancelOnDrop(cancelled.clone());
     let expected_state = state.clone();
-    let code =
-        tokio::task::spawn_blocking(move || accept_code(listener, &expected_state, &cancelled))
-            .await
-            .map_err(|e| e.to_string())??;
+    let code = tokio::task::spawn_blocking(move || {
+        accept_code(listener, callback, &expected_state, &cancelled)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
-    let redirect = REDIRECT_URI.to_string();
     let token = exchange(&[
         ("grant_type", "authorization_code"),
         ("code", &code),
-        ("redirect_uri", &redirect),
+        ("redirect_uri", redirect),
         ("client_id", &client_id),
         ("code_verifier", &verifier),
     ])
     .await?;
 
-    let user_id = fetch_user_id(&token.access_token).await;
+    let user_id = if scopes == SCOPES {
+        fetch_user_id(&token.access_token).await
+    } else {
+        String::new()
+    };
     Ok(SpotifyAuth {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
@@ -211,6 +239,7 @@ fn gen_state() -> String {
 /// authorization code. Times out so a cancelled sign-in doesn't leak the thread.
 fn accept_code(
     listener: std::net::TcpListener,
+    callback: &str,
     expected_state: &str,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
@@ -224,7 +253,7 @@ fn accept_code(
             return Err("timed out waiting for Spotify sign-in".to_string());
         }
         match listener.accept() {
-            Ok((stream, _)) => match handle_conn(stream, expected_state) {
+            Ok((stream, _)) => match handle_conn(stream, callback, expected_state) {
                 Ok(None) => continue,
                 other => return other.map(|o| o.unwrap_or_default()),
             },
@@ -238,6 +267,7 @@ fn accept_code(
 
 fn handle_conn(
     mut stream: std::net::TcpStream,
+    callback: &str,
     expected_state: &str,
 ) -> Result<Option<String>, String> {
     use std::io::{Read, Write};
@@ -254,7 +284,7 @@ fn handle_conn(
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("");
 
-    if !path.starts_with("/callback") {
+    if path.split('?').next() != Some(callback) {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return Ok(None);
@@ -354,7 +384,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         assert!(
-            accept_code(listener, "state", &cancelled)
+            accept_code(listener, "/callback", "state", &cancelled)
                 .unwrap_err()
                 .contains("cancelled")
         );

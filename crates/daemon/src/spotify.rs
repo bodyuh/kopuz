@@ -20,6 +20,9 @@ use crate::external::{ExternalPlayer, ExternalReport};
 use crate::session::SessionHandle;
 use crate::sources::SourceService;
 
+#[cfg(windows)]
+mod native;
+
 /// How often a selected Connect device is asked what it is doing. It is a
 /// remote poll, so it is slow enough not to be rude and fast enough that a
 /// scrub on the phone shows up here.
@@ -38,6 +41,8 @@ pub struct SpotifySink {
     session: SessionHandle,
     sources: Arc<SourceService>,
     state: Mutex<State>,
+    #[cfg(windows)]
+    native: native::NativePlayback,
 }
 
 #[derive(Default)]
@@ -77,6 +82,8 @@ impl SpotifySink {
     pub fn new(session: SessionHandle, sources: Arc<SourceService>) -> Arc<Self> {
         let sink = Arc::new(Self {
             me: std::sync::OnceLock::new(),
+            #[cfg(windows)]
+            native: native::NativePlayback::new(session.state().volume),
             session,
             sources,
             state: Mutex::new(State::default()),
@@ -143,6 +150,10 @@ impl SpotifySink {
             state.selected = device_id.clone();
             device_id.clone().or_else(|| state.device.clone())
         });
+        #[cfg(windows)]
+        if device_id.is_some() {
+            self.native.stop().await;
+        }
         self.restart_poll(device_id.is_some());
         let Some(target) = target else {
             return Ok(());
@@ -506,6 +517,10 @@ impl SpotifySink {
     /// begun on the phone becomes the one this app shows. Stops looking once
     /// the user has picked a device themselves.
     pub fn spawn_discovery(self: &Arc<Self>) {
+        // Windows plays inside Kopuz unless a Connect destination is selected.
+        if cfg!(windows) {
+            return;
+        }
         let sink = self.clone();
         tokio::spawn(async move {
             loop {
@@ -549,7 +564,17 @@ impl ExternalPlayer for SpotifySink {
         let uri = format!("spotify:track:{key}");
         self.with_state(|state| state.commanded = Some((key, Instant::now())));
 
-        if let Some(device) = self.with_state(|state| state.selected.clone()) {
+        let selected = self.with_state(|state| state.selected.clone());
+        #[cfg(windows)]
+        if selected.is_none() {
+            let result = self.native.load(&self.session, track, artwork).await;
+            if let Err(error) = &result {
+                self.notice(error.to_string());
+            }
+            return result;
+        }
+
+        if let Some(device) = selected {
             self.with_state(|state| state.pending_uri = None);
             self.start_uri(device, uri).await;
             return Ok(());
@@ -584,6 +609,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.native.play();
+        #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.resume();
         }
@@ -597,6 +625,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.native.pause();
+        #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.pause();
         }
@@ -610,6 +641,9 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(windows)]
+        self.native.seek(position_ms);
+        #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.seek(position_ms);
         }
@@ -617,6 +651,8 @@ impl ExternalPlayer for SpotifySink {
     }
 
     async fn set_volume(&self, volume: f32) -> Result<(), ApiError> {
+        #[cfg(windows)]
+        self.native.set_volume(volume);
         if let Some(_device) = self.with_state(|state| state.selected.clone()) {
             let access = self.require_access()?;
             let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
@@ -624,6 +660,7 @@ impl ExternalPlayer for SpotifySink {
                 .await
                 .map_err(ApiError::internal);
         }
+        #[cfg(not(windows))]
         if let Some(host) = self.with_state(|state| state.host.clone()) {
             host.set_volume(volume);
         }
@@ -631,6 +668,11 @@ impl ExternalPlayer for SpotifySink {
     }
 
     async fn stop(&self) -> Result<(), ApiError> {
+        #[cfg(windows)]
+        if self.with_state(|state| state.selected.is_none()) {
+            self.native.stop().await;
+            return Ok(());
+        }
         self.with_state(|state| {
             state.pending_uri = None;
             state.commanded = None;
