@@ -15,6 +15,7 @@ use crate::sources::Sources;
 mod apple_music;
 mod audio_cd;
 mod clippsly;
+mod combined;
 mod jellyfin;
 mod local;
 mod nextcloud;
@@ -333,6 +334,14 @@ pub trait MediaSource: Send + Sync {
         &self,
         _query: &str,
     ) -> Result<Vec<crate::ytmusic::browse::search::Suggestion>, SourceError> {
+        Ok(Vec::new())
+    }
+
+    /// Artists matching `query`, as tiles that open their pages. Default none.
+    async fn search_artists(
+        &self,
+        _query: &str,
+    ) -> Result<Vec<crate::ytmusic::discover::DiscoverItem>, SourceError> {
         Ok(Vec::new())
     }
 
@@ -1010,13 +1019,52 @@ pub fn resolve(db: Db, sources: &Sources, source: &Source) -> Box<dyn MediaSourc
     match source {
         Source::LocalLibrary(_) => local(db, source.clone()),
         Source::Server(id) => match ServerConn::resolve(sources) {
-            Some(conn) => remote_source(db, Source::Server(id.clone()), &conn),
+            Some(conn) => {
+                let primary = remote_source(db.clone(), Source::Server(id.clone()), &conn);
+                match joined(db, sources, id, &conn) {
+                    Some((secondary, service)) => Box::new(combined::CombinedSource::new(
+                        primary,
+                        conn.service,
+                        secondary,
+                        service,
+                    )),
+                    None => primary,
+                }
+            }
             None => Box::new(OfflineServerSource {
                 db,
                 source: Source::Server(id.clone()),
             }),
         },
     }
+}
+
+/// Services whose sources join into one: either one active brings the other.
+pub const JOINED_SERVICES: [MusicService; 2] = [MusicService::Spotify, MusicService::SoundCloud];
+
+/// The other joined service's source, filed under the active source's id so
+/// that what it lists lands in the same library.
+fn joined(
+    db: Db,
+    sources: &Sources,
+    id: &str,
+    conn: &ServerConn,
+) -> Option<(Box<dyn MediaSource>, MusicService)> {
+    if !JOINED_SERVICES.contains(&conn.service) {
+        return None;
+    }
+    let companion = sources.companion.as_ref()?;
+    if companion.service == conn.service || !JOINED_SERVICES.contains(&companion.service) {
+        return None;
+    }
+    let mut beside = sources.clone();
+    beside.server = Some(companion.clone());
+    beside.companion = None;
+    let companion_conn = ServerConn::resolve(&beside)?;
+    Some((
+        remote_source(db, Source::Server(id.to_string()), &companion_conn),
+        companion.service,
+    ))
 }
 
 /// The [`MediaSource`] for the app's active source.

@@ -9,6 +9,10 @@ pub struct Sources {
     pub active: Source,
     /// The active server hydrated with its credentials; `None` while a folder source is active.
     pub server: Option<MusicServer>,
+    /// The other joined service (Spotify beside SoundCloud, or the reverse)
+    /// hydrated with its credentials, so the active source covers both.
+    /// Derived, never stored.
+    pub companion: Option<MusicServer>,
     pub servers: Vec<SavedServer>,
     /// Library roots per server id, for backends whose library is a folder tree (Nextcloud); no entry means auto-detect.
     pub folders: HashMap<String, Vec<String>>,
@@ -24,6 +28,7 @@ impl Default for Sources {
         Self {
             active: Source::default(),
             server: None,
+            companion: None,
             servers: Vec::new(),
             folders: HashMap::new(),
             device_id: new_device_id(),
@@ -36,6 +41,7 @@ impl From<db::StoredSources> for Sources {
         Self {
             active: stored.active,
             server: stored.server,
+            companion: None,
             servers: stored.servers,
             folders: stored.folders,
             device_id: stored.device_id.unwrap_or_else(new_device_id),

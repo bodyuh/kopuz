@@ -503,6 +503,44 @@ pub async fn discover_home(access: &str) -> Result<crate::ytmusic::discover::Dis
     })
 }
 
+/// Artists matching `query`, as tiles that open their pages.
+pub async fn search_artists(
+    access: &str,
+    query: &str,
+) -> Result<Vec<crate::ytmusic::discover::DiscoverItem>, String> {
+    let body = get_json(
+        access,
+        &format!("{API}/search"),
+        &[
+            ("q", query.to_string()),
+            ("type", "artist".to_string()),
+            ("limit", "10".to_string()),
+        ],
+        "artist search",
+    )
+    .await?;
+    Ok(body["artists"]["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|artist| {
+                    let id = artist["id"].as_str().filter(|id| !id.is_empty())?;
+                    Some(crate::ytmusic::discover::DiscoverItem::Artist {
+                        channel_id: id.to_string(),
+                        name: artist["name"].as_str().unwrap_or_default().to_string(),
+                        subtitle: artist["followers"]["total"]
+                            .as_u64()
+                            .map(|total| format!("{total} followers")),
+                        thumbnail: first_image(&artist["images"]),
+                        actions: Default::default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// Whether `text` is a Spotify id (22 base-62 characters) rather than a name.
 fn is_spotify_id(text: &str) -> bool {
     text.len() == 22 && text.bytes().all(|byte| byte.is_ascii_alphanumeric())

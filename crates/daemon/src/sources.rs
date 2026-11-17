@@ -130,11 +130,33 @@ fn db_error(error: db::DbError) -> ApiError {
     ApiError::internal(format!("database error: {error}"))
 }
 
+/// The other joined service's saved server, signed in, when the active source
+/// is one of them: Spotify beside SoundCloud, or SoundCloud beside Spotify.
+async fn companion_for(db: &db::Db, sources: &Sources) -> Option<config::MusicServer> {
+    let joined = server::source::JOINED_SERVICES;
+    let active = sources.server.as_ref()?.service;
+    if !joined.contains(&active) {
+        return None;
+    }
+    let saved = sources
+        .servers
+        .iter()
+        .find(|saved| saved.service != active && joined.contains(&saved.service))?;
+    match db.load_server(&saved.id).await {
+        Ok(server) => server,
+        Err(error) => {
+            tracing::warn!(%error, server = %saved.id, "the joined service could not be read");
+            None
+        }
+    }
+}
+
 /// The stored sources, storing a device id the first time one is made.
 pub async fn load(db: &db::Db) -> Result<Sources, db::DbError> {
     let stored = db.load_sources().await?;
     let fresh = stored.device_id.is_none();
-    let sources = Sources::from(stored);
+    let mut sources = Sources::from(stored);
+    sources.companion = companion_for(db, &sources).await;
     if fresh {
         db.set_device_id(&sources.device_id).await?;
     }
@@ -368,6 +390,7 @@ impl SourceService {
         let mut held = self.current.lock().await;
         let mut next = Sources::clone(&held.saved);
         mutate(&mut next);
+        next.companion = companion_for(&self.db, &next).await;
         if next == *held.saved && !(select_saved && held.temporary.is_some()) {
             return Ok(held.running());
         }
@@ -386,6 +409,25 @@ impl SourceService {
         // A caller told of the change reads it back at once, so the library reads have to have moved first.
         let _ = adopted.await;
         Ok(next)
+    }
+
+    /// Read the joined service's sign-in again, after its credentials moved
+    /// without the saved sources changing (a refreshed token, a new login).
+    async fn refresh_companion(&self) {
+        let mut held = self.current.lock().await;
+        let companion = companion_for(&self.db, &held.saved).await;
+        if held.saved.companion == companion {
+            return;
+        }
+        let mut next = Sources::clone(&held.saved);
+        next.companion = companion;
+        held.saved = Arc::new(next);
+        let running = held.running();
+        self.session
+            .set_active_source(Some(self.build_active(&running)));
+        let adopted = self.session.adopt_sources(running);
+        drop(held);
+        let _ = adopted.await;
     }
 
     fn build_active(&self, sources: &Sources) -> server::source::ActiveSource {
@@ -1163,6 +1205,9 @@ impl SourceService {
         // from the old one stops.
         if active && user_changed {
             self.session.reset_playback().await?;
+        }
+        if !active {
+            self.refresh_companion().await;
         }
         self.session.invalidate(Table::Servers);
         self.source_info(&provision.server_id).await
@@ -2030,7 +2075,9 @@ impl SourceService {
         let service = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(300));
-            let mut since_spotify = 0u32;
+            // The stored token is usually past its hour by the next start, so
+            // the first tick renews it instead of waiting half an hour.
+            let mut since_spotify = 5u32;
             let mut since_client_version = 0u32;
             loop {
                 ticker.tick().await;
@@ -2086,17 +2133,17 @@ impl SourceService {
 
     async fn refresh_spotify(&self) {
         let sources = self.snapshot().await;
-        let Some(server) = sources
-            .server
-            .as_ref()
-            .filter(|server| server.service == config::MusicService::Spotify)
-        else {
-            return;
+        let spotify = |server: &&config::MusicServer| server.service == config::MusicService::Spotify;
+        // The active Spotify, or the one joined beside SoundCloud: its token
+        // expires within the hour just the same.
+        let (server, id) = match sources.server.as_ref().filter(spotify) {
+            Some(server) => (server, sources.active.server_id().map(str::to_string)),
+            None => match sources.companion.as_ref().filter(spotify) {
+                Some(server) => (server, server.id.clone()),
+                None => return,
+            },
         };
-        let (Some(packed), Some(id)) = (
-            server.access_token.clone(),
-            sources.active.server_id().map(str::to_string),
-        ) else {
+        let (Some(packed), Some(id)) = (server.access_token.clone(), id) else {
             return;
         };
         match server::spotify::auth::refresh_packed(&packed, server.url.clone()).await {

@@ -463,6 +463,54 @@ async fn auth_get_json(
         .map_err(|e| format!("SoundCloud API JSON: {}", e.without_url()))
 }
 
+/// SoundCloud users matching `query`, as artist tiles that open their pages.
+pub(crate) async fn search_users(
+    query: &str,
+) -> Result<Vec<crate::ytmusic::discover::DiscoverItem>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let http = http_client();
+    let lookup = |cid: String| {
+        let http = http.clone();
+        async move {
+            let url = reqwest::Url::parse_with_params(
+                &format!("{API_V2}/search/users"),
+                &[("q", query), ("client_id", cid.as_str()), ("limit", "10")],
+            )
+            .map_err(|error| error.to_string())?;
+            auth_get_json(&http, url.as_str(), None).await
+        }
+    };
+    let found = match lookup(client_id(&http, false).await?).await {
+        Ok(found) => found,
+        Err(_) => lookup(client_id(&http, true).await?).await?,
+    };
+    Ok(found["collection"]
+        .as_array()
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(|user| {
+                    let id = user["id"].as_u64()?;
+                    Some(crate::ytmusic::discover::DiscoverItem::Artist {
+                        channel_id: id.to_string(),
+                        name: user["username"].as_str().unwrap_or_default().to_string(),
+                        subtitle: user["followers_count"]
+                            .as_u64()
+                            .map(|count| format!("{} followers", short_count(count))),
+                        thumbnail: user["avatar_url"]
+                            .as_str()
+                            .filter(|url| !url.is_empty())
+                            .map(upscale_artwork),
+                        actions: Default::default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// A SoundCloud user's page, as the catalog shows an artist: their popular
 /// tracks, then everything they posted. `user` is the numeric user id, or a
 /// name, which is looked up first.

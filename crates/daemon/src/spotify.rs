@@ -76,10 +76,13 @@ struct State {
 
 /// The Web API access token `sources` hold for an active Spotify source.
 fn access_of(sources: &server::sources::Sources) -> Option<String> {
-    let server = sources.server.as_ref()?;
-    if server.service != config::MusicService::Spotify {
-        return None;
-    }
+    let spotify = |server: &&config::MusicServer| server.service == config::MusicService::Spotify;
+    // Spotify active, or joined beside SoundCloud.
+    let server = sources
+        .server
+        .as_ref()
+        .filter(spotify)
+        .or_else(|| sources.companion.as_ref().filter(spotify))?;
     let packed = server.access_token.clone()?;
     let access = server::spotify::auth::unpack_token(&packed).0;
     (!access.is_empty()).then_some(access)

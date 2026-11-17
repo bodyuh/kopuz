@@ -154,6 +154,15 @@ impl MediaSource for SoundcloudSource {
         Ok((tracks, Vec::new()))
     }
 
+    async fn search_artists(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::ytmusic::discover::DiscoverItem>, SourceError> {
+        crate::soundcloud::search_users(query)
+            .await
+            .map_err(SourceError::from)
+    }
+
     async fn fetch_artist(
         &self,
         channel_id: &str,

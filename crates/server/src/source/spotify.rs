@@ -153,6 +153,16 @@ impl MediaSource for SpotifySource {
             .map_err(SourceError::from)
     }
 
+    async fn search_artists(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::ytmusic::discover::DiscoverItem>, SourceError> {
+        let token = self.token()?;
+        crate::spotify::api::search_artists(token, query)
+            .await
+            .map_err(SourceError::from)
+    }
+
     async fn fetch_artist(
         &self,
         channel_id: &str,
