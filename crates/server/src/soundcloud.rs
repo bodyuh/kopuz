@@ -788,12 +788,20 @@ pub(crate) async fn get_playlist_entries(
 
 /// Like or unlike a track on the signed-in account.
 ///
-/// Routes through the public `api.soundcloud.com` like endpoint, which (unlike
-/// the web player's `api-v2` host) isn't behind DataDome bot-protection — so a
-/// plain request with the `OAuth` token works without matching a browser TLS
-/// fingerprint. `datadome` is kept only for the legacy `api-v2` fallback.
+/// Sent from the soundcloud.com page the app hosts when there is one (see
+/// [`page`]), since the web player's route refuses requests that do not come
+/// from a browser. Without a page, or when it fails, the public
+/// `api.soundcloud.com` route is tried, then the web player's route directly.
 pub(crate) async fn set_track_like(track_id: &str, like: bool, token: &str) -> Result<(), String> {
     let http = http_client();
+
+    match set_track_like_in_page(&http, track_id, like, token).await {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(error)) => {
+            tracing::warn!(%error, "SoundCloud like from the hosted page failed; trying the API")
+        }
+        None => {}
+    }
 
     let url = format!("{API_V1}/likes/tracks/{track_id}");
     let req = if like {
@@ -817,6 +825,50 @@ pub(crate) async fn set_track_like(track_id: &str, like: bool, token: &str) -> R
             set_track_like_v2(&http, track_id, like, token).await
         }
     }
+}
+
+/// The web player's like route, sent from the soundcloud.com page the app
+/// hosts. `None` when no page is hosted. A refusal right after the page opens
+/// is retried once, since the page may not have finished its checks yet.
+async fn set_track_like_in_page(
+    http: &reqwest::Client,
+    track_id: &str,
+    like: bool,
+    token: &str,
+) -> Option<Result<(), String>> {
+    let cid = match client_id(http, false).await {
+        Ok(cid) => cid,
+        Err(error) => return Some(Err(error)),
+    };
+    let Some(me) = derive_user_id(token).await else {
+        return Some(Err(
+            "SoundCloud: couldn't resolve the signed-in user id".to_string()
+        ));
+    };
+    let url = format!("{API_V2}/users/{me}/track_likes/{track_id}?client_id={cid}");
+    let method = if like { "PUT" } else { "DELETE" };
+    let headers = vec![
+        ("Authorization".to_string(), format!("OAuth {token}")),
+        (
+            "Accept".to_string(),
+            "application/json, text/javascript, */*; q=0.01".to_string(),
+        ),
+    ];
+    for attempt in 0..2 {
+        let status = match page::send(method, url.clone(), headers.clone()).await? {
+            Ok(status) => status,
+            Err(error) => return Some(Err(error)),
+        };
+        if (200..300).contains(&status) {
+            return Some(Ok(()));
+        }
+        if attempt == 0 && matches!(status, 401 | 403) {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            continue;
+        }
+        return Some(Err(format!("SoundCloud like from the page: HTTP {status}")));
+    }
+    Some(Err("SoundCloud like from the page was refused".to_string()))
 }
 
 /// The web player's like route: `PUT`/`DELETE /users/{me}/track_likes/{id}`.
@@ -856,6 +908,61 @@ fn user_name(user: &Value) -> String {
         .filter(|permalink| !permalink.is_empty())
         .unwrap_or(username)
         .to_string()
+}
+
+/// Requests sent from inside a soundcloud.com page the app hosts.
+///
+/// The web player's write routes sit behind bot protection that turns away
+/// anything that is not a browser, so a like sent from plain HTTP is refused.
+/// A desktop app that can host a web page registers one with [`serve`]; the
+/// request then goes out from that page, the same way the web player sends it.
+pub mod page {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, oneshot};
+
+    /// One request for the page to send. `reply` gets the HTTP status, or why
+    /// the request could not be made.
+    pub struct Request {
+        pub method: String,
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub reply: oneshot::Sender<Result<u16, String>>,
+    }
+
+    static PAGE: OnceLock<mpsc::UnboundedSender<Request>> = OnceLock::new();
+
+    /// Take the requests meant for the page. Only the first caller gets them.
+    pub fn serve() -> Option<mpsc::UnboundedReceiver<Request>> {
+        let (sender, requests) = mpsc::unbounded_channel();
+        PAGE.set(sender).ok()?;
+        Some(requests)
+    }
+
+    /// Send a request through the page. `None` when no page is hosted.
+    pub(crate) async fn send(
+        method: &str,
+        url: String,
+        headers: Vec<(String, String)>,
+    ) -> Option<Result<u16, String>> {
+        let page = PAGE.get()?;
+        let (reply, answer) = oneshot::channel();
+        page.send(Request {
+            method: method.to_string(),
+            url,
+            headers,
+            reply,
+        })
+        .ok()?;
+        Some(
+            match tokio::time::timeout(Duration::from_secs(40), answer).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("the SoundCloud page closed".to_string()),
+                Err(_) => Err("the SoundCloud page did not answer".to_string()),
+            },
+        )
+    }
 }
 
 /// One-time SoundCloud sign-in via an isolated browser profile, reusing the

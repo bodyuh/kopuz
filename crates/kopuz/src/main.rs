@@ -38,6 +38,8 @@ mod material3;
 mod static_assets;
 #[cfg(not(target_os = "android"))]
 mod ui_profile;
+#[cfg(target_os = "windows")]
+mod soundcloud_page;
 mod updates;
 #[cfg(target_os = "linux")]
 mod video_http;
@@ -512,6 +514,8 @@ fn App() -> Element {
             exit_flush::finish(unsent, Some(ui_prefs.unsent()));
         }
     });
+    #[cfg(target_os = "windows")]
+    soundcloud_page::use_soundcloud_page();
     // `window().close()` (the title bar's ×, the tray's Quit) tears the window down without a CloseRequested event.
     #[cfg(not(target_os = "android"))]
     use_drop(exit_flush::finish_with_stashed);
