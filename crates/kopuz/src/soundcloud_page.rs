@@ -9,7 +9,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use dioxus::desktop::tao::window::Window;
 use dioxus::desktop::wry::dpi::{LogicalPosition, LogicalSize};
 use dioxus::desktop::wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 use dioxus::prelude::*;
@@ -48,8 +50,48 @@ pub fn use_soundcloud_page() {
     });
 }
 
+/// The page and the window it sits in, once it is built.
+#[derive(Clone, Default)]
+struct Shown(Rc<RefCell<Option<(Rc<WebView>, Arc<Window>)>>>);
+
+impl Shown {
+    /// Show the page over the middle of the window, or hide it again.
+    fn set(&self, visible: bool) {
+        let Some((view, window)) = self.0.borrow().clone() else {
+            return;
+        };
+        let bounds = if visible {
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            let width = size.width.min(460.0);
+            let height = size.height.min(640.0);
+            Rect {
+                position: LogicalPosition::new(
+                    (size.width - width) / 2.0,
+                    (size.height - height) / 2.0,
+                )
+                .into(),
+                size: LogicalSize::new(width, height).into(),
+            }
+        } else {
+            hidden_bounds()
+        };
+        let _ = view.set_bounds(bounds);
+        let _ = view.set_visible(visible);
+        if visible {
+            let _ = view.focus();
+        }
+    }
+}
+
+fn hidden_bounds() -> Rect {
+    Rect {
+        position: LogicalPosition::new(0, 0).into(),
+        size: LogicalSize::new(1, 1).into(),
+    }
+}
+
 struct Page {
-    view: WebView,
+    view: Rc<WebView>,
     _context: WebContext,
     loaded: watch::Receiver<bool>,
     waiting: Waiting,
@@ -57,7 +99,7 @@ struct Page {
 }
 
 impl Page {
-    fn open(window: &dioxus::desktop::tao::window::Window) -> Result<Self, String> {
+    fn open(window: &Arc<Window>) -> Result<Self, String> {
         let data = directories::ProjectDirs::from("moe", "kopuz", "kopuz")
             .map(|dirs| dirs.cache_dir().join("soundcloud-page"))
             .unwrap_or_else(|| std::path::PathBuf::from("./cache/soundcloud-page"));
@@ -66,23 +108,24 @@ impl Page {
 
         let waiting: Waiting = Rc::default();
         let answers = waiting.clone();
+        let shown = Shown::default();
+        let show = shown.clone();
         let (loaded_tx, loaded) = watch::channel(false);
 
         let view = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(HOME)
             .with_visible(false)
-            .with_bounds(Rect {
-                position: LogicalPosition::new(0, 0).into(),
-                size: LogicalSize::new(1, 1).into(),
-            })
+            .with_bounds(hidden_bounds())
             .with_on_page_load_handler(move |event, _url| {
                 if matches!(event, PageLoadEvent::Finished) {
                     let _ = loaded_tx.send(true);
                 }
             })
-            .with_ipc_handler(move |message| answer(&answers, message.body()))
-            .build_as_child(window)
+            .with_ipc_handler(move |message| answer(&answers, &show, message.body()))
+            .build_as_child(&**window)
             .map_err(|error| format!("SoundCloud page: {error}"))?;
+        let view = Rc::new(view);
+        *shown.0.borrow_mut() = Some((view.clone(), window.clone()));
         tracing::info!("opened the SoundCloud page for likes");
 
         Ok(Self {
@@ -117,11 +160,52 @@ impl Page {
         let script = format!(
             r#"(async () => {{
   const id = {id};
+  const url = {url};
+  const method = {method};
+  const base = {headers};
+  const post = (message) => window.ipc.postMessage(JSON.stringify(Object.assign({{ id }}, message)));
+  // The web player sends its DataDome cookie as a header too.
+  const send = () => {{
+    const headers = Object.assign({{}}, base);
+    const datadome = document.cookie.match(/(?:^|;\s*)datadome=([^;]+)/);
+    if (datadome) headers["x-datadome-clientid"] = datadome[1];
+    return fetch(url, {{ method, credentials: "include", headers }});
+  }};
+  // SoundCloud asked for a check: show it, and wait for the person to pass it.
+  const check = (target) => new Promise((resolve) => {{
+    const frame = document.createElement("iframe");
+    frame.src = target;
+    frame.style.cssText = "position:fixed;inset:0;width:100%;height:100%;border:0;z-index:2147483647;background:#fff";
+    const passed = (event) => {{
+      let host = "";
+      try {{ host = new URL(event.origin).hostname; }} catch (_) {{ return; }}
+      if (!host.endsWith("captcha-delivery.com")) return;
+      let data = event.data;
+      try {{ if (typeof data === "string") data = JSON.parse(data); }} catch (_) {{ return; }}
+      if (!data || typeof data.cookie !== "string") return;
+      document.cookie = data.cookie;
+      window.removeEventListener("message", passed);
+      frame.remove();
+      resolve();
+    }};
+    window.addEventListener("message", passed);
+    document.body.appendChild(frame);
+  }});
   try {{
-    const response = await fetch({url}, {{ method: {method}, credentials: "include", headers: {headers} }});
-    window.ipc.postMessage(JSON.stringify({{ id, status: response.status }}));
+    let response = await send();
+    if (response.status === 403) {{
+      let body = null;
+      try {{ body = await response.clone().json(); }} catch (_) {{}}
+      if (body && typeof body.url === "string" && body.url.includes("captcha-delivery.com")) {{
+        post({{ check: true }});
+        await check(body.url);
+        post({{ check: false }});
+        response = await send();
+      }}
+    }}
+    post({{ status: response.status }});
   }} catch (error) {{
-    window.ipc.postMessage(JSON.stringify({{ id, status: 0, error: String(error) }}));
+    post({{ status: 0, error: String(error) }});
   }}
 }})();"#,
             url = serde_json::Value::String(url),
@@ -137,13 +221,20 @@ impl Page {
 }
 
 /// Hand a reply from the page to the request waiting for it.
-fn answer(waiting: &Waiting, body: &str) {
+fn answer(waiting: &Waiting, shown: &Shown, body: &str) {
     let Ok(reply) = serde_json::from_str::<serde_json::Value>(body) else {
         return;
     };
     let Some(id) = reply["id"].as_u64() else {
         return;
     };
+    // SoundCloud wants a check the person has to pass themselves.
+    if let Some(check) = reply["check"].as_bool() {
+        tracing::info!(check, "SoundCloud asked for a check before the like");
+        shown.set(check);
+        return;
+    }
+    shown.set(false);
     let Some(sender) = waiting.borrow_mut().remove(&id) else {
         return;
     };

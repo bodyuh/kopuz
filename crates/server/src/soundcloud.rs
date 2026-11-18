@@ -956,7 +956,7 @@ pub mod page {
         })
         .ok()?;
         Some(
-            match tokio::time::timeout(Duration::from_secs(40), answer).await {
+            match tokio::time::timeout(Duration::from_secs(180), answer).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err("the SoundCloud page closed".to_string()),
                 Err(_) => Err("the SoundCloud page did not answer".to_string()),
