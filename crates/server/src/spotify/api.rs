@@ -236,6 +236,12 @@ pub async fn saved_tracks_page(
 /// playlists while denying access to their entries; [`playlist_entries`]
 /// reports that restriction explicitly.
 pub async fn list_playlists(access: &str) -> Result<Vec<PlaylistSummary>, String> {
+    // Spotify serves the entries of only the playlists one owns or
+    // collaborates on; a followed one would list and then fail to open.
+    let me = get_json(access, &format!("{API}/me"), &[], "me")
+        .await
+        .ok()
+        .and_then(|me| me["id"].as_str().map(str::to_string));
     let mut out = Vec::new();
     let mut offset: u32 = 0;
     loop {
@@ -254,6 +260,12 @@ pub async fn list_playlists(access: &str) -> Result<Vec<PlaylistSummary>, String
             let Some(id) = p["id"].as_str().filter(|s| !s.is_empty()) else {
                 continue;
             };
+            let owned = me
+                .as_deref()
+                .is_none_or(|me| p["owner"]["id"].as_str() == Some(me));
+            if !owned && p["collaborative"].as_bool() != Some(true) {
+                continue;
+            }
             out.push(PlaylistSummary {
                 id: id.to_string(),
                 name: p["name"].as_str().unwrap_or_default().to_string(),

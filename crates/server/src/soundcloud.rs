@@ -353,11 +353,7 @@ fn parse_track(item: &Value) -> Option<Track> {
         .unwrap_or_default()
         .to_string();
     let user = item.get("user");
-    let artist = user
-        .and_then(|u| u.get("username"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let artist = user.map(user_name).unwrap_or_default();
 
     let artist_id = user
         .and_then(|u| u.get("id"))
@@ -495,7 +491,7 @@ pub(crate) async fn search_users(
                     let id = user["id"].as_u64()?;
                     Some(crate::ytmusic::discover::DiscoverItem::Artist {
                         channel_id: id.to_string(),
-                        name: user["username"].as_str().unwrap_or_default().to_string(),
+                        name: user_name(user),
                         subtitle: user["followers_count"]
                             .as_u64()
                             .map(|count| format!("{} followers", short_count(count))),
@@ -545,10 +541,7 @@ pub(crate) async fn artist_page(
             auth_get_json(&http, &profile_url(&cid), token).await?
         }
     };
-    let name = profile["username"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let name = user_name(&profile);
 
     let tracks_of = |json: &Value| -> Vec<Track> {
         json["collection"]
@@ -809,6 +802,39 @@ pub(crate) async fn set_track_like(track_id: &str, like: bool, token: &str) -> R
         http.delete(&url)
     }
     .header("Accept", "application/json; charset=utf-8");
+    let v1 = apply_auth(req, Some(token))
+        .send()
+        .await
+        .map_err(|e| format!("SoundCloud like HTTP: {}", e.without_url()))?
+        .error_for_status()
+        .map_err(|e| format!("SoundCloud like HTTP: {}", e.without_url()));
+    match v1 {
+        Ok(_) => Ok(()),
+        // The public host refuses a web-player token for some accounts; the
+        // web player's own route takes it.
+        Err(error) => {
+            tracing::debug!(%error, "SoundCloud v1 like refused; trying the web player's route");
+            set_track_like_v2(&http, track_id, like, token).await
+        }
+    }
+}
+
+/// The web player's like route: `PUT`/`DELETE /users/{me}/track_likes/{id}`.
+async fn set_track_like_v2(
+    http: &reqwest::Client,
+    track_id: &str,
+    like: bool,
+    token: &str,
+) -> Result<(), String> {
+    let cid = client_id(http, false).await?;
+    let me = derive_user_id(token)
+        .await
+        .ok_or("SoundCloud: couldn't resolve the signed-in user id")?;
+    let url = format!("{API_V2}/users/{me}/track_likes/{track_id}?client_id={cid}");
+    let req = if like { http.put(&url) } else { http.delete(&url) }
+        .header("Accept", "application/json; charset=utf-8")
+        .header("Origin", WEB_HOST)
+        .header("Referer", format!("{WEB_HOST}/"));
     apply_auth(req, Some(token))
         .send()
         .await
@@ -816,6 +842,20 @@ pub(crate) async fn set_track_like(track_id: &str, like: bool, token: &str) -> R
         .error_for_status()
         .map_err(|e| format!("SoundCloud like HTTP: {}", e.without_url()))?;
     Ok(())
+}
+
+/// The name to show for a SoundCloud user: their display name, or, when that
+/// is only invisible or decorative characters, the readable profile slug.
+fn user_name(user: &Value) -> String {
+    let username = user["username"].as_str().unwrap_or_default().trim();
+    if username.chars().any(char::is_alphanumeric) {
+        return username.to_string();
+    }
+    user["permalink"]
+        .as_str()
+        .filter(|permalink| !permalink.is_empty())
+        .unwrap_or(username)
+        .to_string()
 }
 
 /// One-time SoundCloud sign-in via an isolated browser profile, reusing the

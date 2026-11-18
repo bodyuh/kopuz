@@ -133,6 +133,32 @@ impl Syncs {
             return Some(OFFLINE_RECHECK);
         }
         let source = &sources.active;
+        // A service joined beside this one brings likes, playlists and a
+        // library this source never pulled, so everything is due at once.
+        let joined = sources
+            .companion
+            .as_ref()
+            .and_then(|server| server.id.clone())
+            .unwrap_or_default();
+        let synced_with = self
+            .db
+            .meta_get(JOINED_KEY, source.as_str())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if synced_with != joined {
+            for kind in KINDS {
+                if let Some(key) = stamp_key(kind)
+                    && let Err(error) = self.db.meta_put(key, source.as_str(), "0").await
+                {
+                    tracing::warn!(%error, ?kind, "could not mark a sync due");
+                }
+            }
+            if let Err(error) = self.db.meta_put(JOINED_KEY, source.as_str(), &joined).await {
+                tracing::warn!(%error, "could not record the joined service");
+            }
+        }
         let plan = plan(&self.db, source, interval(config)).await;
         let mut blocked = false;
         for kind in plan.due {
@@ -166,12 +192,22 @@ impl Syncs {
 
 const RETRY_BLOCKED: Duration = Duration::from_secs(60);
 
-/// What re-arms the schedule: the source, the interval, and whether the source can sync at all.
-fn arm_key(config: &config::Settings, sources: &Sources) -> (config::Source, u32, bool) {
+/// Which joined service a source last synced alongside.
+const JOINED_KEY: &str = "synced:joined";
+
+/// What re-arms the schedule: the source, the interval, whether the source can sync at all, and the service joined beside it.
+fn arm_key(
+    config: &config::Settings,
+    sources: &Sources,
+) -> (config::Source, u32, bool, Option<String>) {
     (
         sources.active.clone(),
         config.library.sync_interval_minutes,
         server::server_ops::ServerConn::resolve(sources).is_some(),
+        sources
+            .companion
+            .as_ref()
+            .and_then(|server| server.id.clone()),
     )
 }
 
