@@ -1005,8 +1005,22 @@ pub type ActiveSource = std::sync::Arc<dyn MediaSource>;
 /// syncs the configured server even while a local page is open.
 pub fn configured_server(db: Db, sources: &Sources) -> Option<Box<dyn MediaSource>> {
     let conn = ServerConn::resolve(sources)?;
-    let source = Source::Server(sources.active_server_id().unwrap_or_default());
-    Some(remote_source(db, source, &conn))
+    let id = sources.active_server_id().unwrap_or_default();
+    Some(with_joined(db, sources, &id, conn))
+}
+
+/// The server's source, joined with the other joined service when there is one.
+fn with_joined(db: Db, sources: &Sources, id: &str, conn: ServerConn) -> Box<dyn MediaSource> {
+    let primary = remote_source(db.clone(), Source::Server(id.to_string()), &conn);
+    match joined(db, sources, id, &conn) {
+        Some((secondary, service)) => Box::new(combined::CombinedSource::new(
+            primary,
+            conn.service,
+            secondary,
+            service,
+        )),
+        None => primary,
+    }
 }
 
 /// A local (filesystem) [`MediaSource`] using the supplied DB namespace.
@@ -1019,18 +1033,7 @@ pub fn resolve(db: Db, sources: &Sources, source: &Source) -> Box<dyn MediaSourc
     match source {
         Source::LocalLibrary(_) => local(db, source.clone()),
         Source::Server(id) => match ServerConn::resolve(sources) {
-            Some(conn) => {
-                let primary = remote_source(db.clone(), Source::Server(id.clone()), &conn);
-                match joined(db, sources, id, &conn) {
-                    Some((secondary, service)) => Box::new(combined::CombinedSource::new(
-                        primary,
-                        conn.service,
-                        secondary,
-                        service,
-                    )),
-                    None => primary,
-                }
-            }
+            Some(conn) => with_joined(db, sources, id, conn),
             None => Box::new(OfflineServerSource {
                 db,
                 source: Source::Server(id.clone()),

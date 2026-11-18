@@ -143,7 +143,17 @@ async fn companion_for(db: &db::Db, sources: &Sources) -> Option<config::MusicSe
         .iter()
         .find(|saved| saved.service != active && joined.contains(&saved.service))?;
     match db.load_server(&saved.id).await {
-        Ok(server) => server,
+        Ok(server) => {
+            if let Some(joined) = server.as_ref() {
+                tracing::info!(
+                    active = ?active,
+                    joined = ?joined.service,
+                    signed_in = joined.access_token.is_some(),
+                    "joined a second service to the active source"
+                );
+            }
+            server
+        }
         Err(error) => {
             tracing::warn!(%error, server = %saved.id, "the joined service could not be read");
             None
@@ -513,6 +523,8 @@ impl SourceService {
                 sources.set_active_server(server);
             }
         }
+        // The service joined beside this one, not the one beside whatever is active now.
+        sources.companion = companion_for(&self.db, &sources).await;
         let active = self.build_active(&sources);
         Ok((sources, active))
     }
@@ -530,6 +542,16 @@ impl SourceService {
         let mut temporary: Vec<_> = self.removable.lock().await.keys().cloned().collect();
         temporary.sort();
         ids.extend(temporary);
+        // A service joined into the active source is part of that entry; it
+        // stands alone again only to be signed back in.
+        if let Some(joined) = servers
+            .companion
+            .as_ref()
+            .filter(|joined| joined.access_token.is_some())
+            .and_then(|joined| joined.id.clone())
+        {
+            ids.retain(|id| *id != joined);
+        }
         let mut sources = Vec::with_capacity(ids.len());
         for id in ids {
             match self.source_info(&id).await {
@@ -584,7 +606,14 @@ impl SourceService {
                     .as_ref()
                     .ok_or_else(|| ApiError::not_found("no such server"))?;
                 let view = crate::services::ServerView::from(server);
-                info.name = server.name.clone();
+                info.name = match resolved.companion.as_ref() {
+                    Some(joined) => format!(
+                        "{} + {}",
+                        server.service.display_name(),
+                        joined.service.display_name()
+                    ),
+                    None => server.name.clone(),
+                };
                 info.needs_network = server.service != config::MusicService::AudioCd;
                 info.works_offline = server.service == config::MusicService::AudioCd
                     || network::is_local(&key, Some(&server.url));
